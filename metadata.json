@@ -1,0 +1,6 @@
+{
+  "name": "ManuscritIA — Resolutor Orgánico de Ejercicios PDF",
+  "description": "Analiza hojas de ejercicios en PDF con Gemini Vision, detecta las zonas en blanco y escribe las respuestas simulando caligrafía humana natural con modo orgánico, tachones y previsualización interactiva.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

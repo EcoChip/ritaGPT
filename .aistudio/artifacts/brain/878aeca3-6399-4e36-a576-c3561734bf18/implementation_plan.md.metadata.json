@@ -1,0 +1,6 @@
+{
+  "summary":  "Plan de implementación para ManuscritIA, una aplicación web que analiza hojas de ejercicios en PDF con Gemini Vision, detecta las zonas en blanco y escribe las respuestas simulando escritura a mano natural (con modo orgánico de errores leves, tachones y variaciones de trazo), permitiendo previsualizar, editar arrastrando las respuestas y exportar el PDF final.",
+  "updatedAt":  "2026-10-22T08:48:22.250048512Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

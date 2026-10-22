@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ManuscritIA — Resolutor Orgánico de Ejercicios PDF</title>
+    <meta name="description" content="Analiza hojas de ejercicios en PDF con Gemini Vision, detecta las zonas en blanco y escribe las respuestas simulando caligrafía humana natural con modo orgánico, tachones y previsualización interactiva." />
+    <meta property="og:title" content="ManuscritIA — Resolutor Orgánico de Ejercicios PDF" />
+    <meta property="og:description" content="Analiza hojas de ejercicios en PDF con Gemini Vision, detecta las zonas en blanco y escribe las respuestas simulando caligrafía humana natural con modo orgánico, tachones y previsualización interactiva." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;600;700&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=Indie+Flower&family=JetBrains+Mono:wght@400;500;600&family=Kalam:wght@400;700&family=Patrick+Hand&family=Plus+Jakarta+Sans:wght@500;600;700&family=Shadows+Into+Light&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased selection:bg-blue-600 selection:text-white">
+    <div id="root"></div>
+    <script>
+      if (!Map.prototype.getOrInsert) {
+        Map.prototype.getOrInsert = function (key, defaultValue) {
+          if (!this.has(key)) {
+            this.set(key, defaultValue);
+          }
+          return this.get(key);
+        };
+      }
+      if (!Map.prototype.getOrInsertComputed) {
+        Map.prototype.getOrInsertComputed = function (key, callbackFn) {
+          if (!this.has(key)) {
+            this.set(key, callbackFn(key));
+          }
+          return this.get(key);
+        };
+      }
+      if (typeof WeakMap !== "undefined") {
+        if (!WeakMap.prototype.getOrInsert) {
+          WeakMap.prototype.getOrInsert = function (key, defaultValue) {
+            if (!this.has(key)) {
+              this.set(key, defaultValue);
+            }
+            return this.get(key);
+          };
+        }
+        if (!WeakMap.prototype.getOrInsertComputed) {
+          WeakMap.prototype.getOrInsertComputed = function (key, callbackFn) {
+            if (!this.has(key)) {
+              this.set(key, callbackFn(key));
+            }
+            return this.get(key);
+          };
+        }
+      }
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
