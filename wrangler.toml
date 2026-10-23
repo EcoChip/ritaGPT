@@ -1,5 +1,5 @@
-name = "ritagpt"
-main = "public/_worker.js"
+name = "rita"
+main = "worker.js"
 compatibility_date = "2024-11-01"
 
 [assets]
