@@ -8,11 +8,17 @@ export interface HandwritingFontOption {
   baseWeight: number;
   lineHeightMultiplier: number;
   isCustom?: boolean;
-  customType?: "uploaded_file" | "drawn_glyphs";
-  /** Base64 data URL for uploaded TTF/OTF/WOFF font */
+  customType?: "uploaded_file" | "drawn_glyphs" | "fused_fonts";
+  /** Base64 data URL for a single uploaded TTF/OTF/WOFF font */
   fontDataUrl?: string;
-  /** Map of character -> PNG data URL for hand-drawn custom glyph fonts */
+  /** Multiple uploaded font data URLs when fusing several uploaded font files */
+  fusedFontDataUrls?: { familyName: string; dataUrl: string; fileName: string }[];
+  /** List of CSS font-family strings to alternate character-by-character so repeated letters (e.g. 'a') never look identical */
+  fusedCssFamilies?: string[];
+  /** Map of character -> single PNG data URL (legacy compatibility) */
   glyphMap?: Record<string, string>;
+  /** Map of character -> array of PNG data URLs (multiple hand-drawn variants per letter, e.g. a1, a2, a3) */
+  glyphVariantsMap?: Record<string, string[]>;
   /** Custom slant in degrees */
   customSlantDeg?: number;
   /** Custom letter spacing in px */
@@ -29,6 +35,9 @@ export interface InkColorOption {
   opacityBase: number;
 }
 
+export type NotebookPaperStyle = "grid" | "lined" | "blank";
+export type SolveTargetMode = "auto" | "in_place" | "notebook";
+
 export interface OrganicSettings {
   enabled: boolean;
   /** Percentage of answers that deliberately include a subtle human mistake (0 - 50) */
@@ -37,12 +46,16 @@ export interface OrganicSettings {
   crossOutRatePercent: number;
   /** Intensity of stroke angle, baseline jitter, and ink pressure variation (0 - 100) */
   strokeVariationPercent: number;
+  /** Ensures repeated letters (e.g. multiple 'a's) vary in font/shape/scale so they are never identical */
+  antiCloneLetterVariation: boolean;
 }
 
 export interface StyleSettings {
   fontId: HandwritingFontId;
   inkId: InkColorId;
   organic: OrganicSettings;
+  solveTargetMode: SolveTargetMode;
+  notebookPaperStyle: NotebookPaperStyle;
 }
 
 export interface NormalizedBox {
@@ -80,6 +93,8 @@ export interface AnswerAnnotation {
   manualFontSize: number;
   /** Deterministic seed for organic jitter, slant, and ink pressure */
   seed: number;
+  /** True if this annotation is placed on a generated notebook page ("En tu cuaderno") */
+  isNotebookEntry?: boolean;
 }
 
 export interface PdfPageData {
@@ -93,6 +108,10 @@ export interface PdfPageData {
   status: "idle" | "solving" | "solved" | "error";
   pageSummary?: string;
   errorMessage?: string;
+  /** True if this page is an automatically generated separate notebook sheet */
+  isNotebookPage?: boolean;
+  /** Source page number that generated this notebook sheet */
+  sourcePageNumber?: number;
 }
 
 export interface SolvingProgressState {
@@ -104,6 +123,21 @@ export interface SolvingProgressState {
 }
 
 export const HANDWRITING_FONTS: HandwritingFontOption[] = [
+  {
+    id: "fused-natural-mix",
+    name: "Fusión Orgánica Multi-Letra (3 Fuentes)",
+    cssFamily: "'Caveat', cursive",
+    fusedCssFamilies: [
+      "'Caveat', cursive",
+      "'Kalam', cursive",
+      "'Patrick Hand', cursive",
+    ],
+    description:
+      "Alterna automáticamente varias caligrafías letra a letra para que dos 'a' nunca sean iguales",
+    baseWeight: 500,
+    lineHeightMultiplier: 1.14,
+    customType: "fused_fonts",
+  },
   {
     id: "caveat",
     name: "Cuaderno Fluido",

@@ -4,15 +4,22 @@ import {
   HANDWRITING_FONTS,
   HandwritingFontOption,
   INK_COLORS,
+  NotebookPaperStyle,
   PdfPageData,
+  SolveTargetMode,
   SolvingProgressState,
   StyleSettings,
 } from "./types";
 import {
-  convertImageFilesToPdfBytes,
+  isPdfByteSignature,
+  loadImagesDirectlyAsPagesAndPdf,
   renderPdfToPageImages,
 } from "./utils/pdfLoader";
-import { generateSampleExercisePdf } from "./utils/samplePdf";
+import { generateSampleWorksheetDirect } from "./utils/samplePdf";
+import {
+  buildNotebookPagesForExercises,
+  generateNotebookBackgroundDataUrl,
+} from "./utils/notebookGenerator";
 import {
   computeAutoFontSize,
   exportAnnotatedPdfBytes,
@@ -23,6 +30,11 @@ import {
   loadSavedCustomFonts,
   saveCustomFontsToStorage,
 } from "./utils/customFontManager";
+import { refinePageAnnotationsWithPixels } from "./utils/blankRefiner";
+import {
+  getBuildTimeGeminiKey,
+  solvePageViaDirectRestApi,
+} from "./utils/geminiClientSolver";
 import { InteractivePageCanvas } from "./components/InteractivePageCanvas";
 import { CustomFontStudioModal } from "./components/CustomFontStudioModal";
 import { CameraCaptureModal } from "./components/CameraCaptureModal";
@@ -50,10 +62,22 @@ import {
   ArrowRight,
   Image as ImageIcon,
   FolderOpen,
+  BookOpen,
+  Layers,
 } from "lucide-react";
 
+const ATTACHED_BOOK_IMAGE_PATH = "/assets/aistudio/IMG_7476_d8d95cb2.jpeg";
+
+function formatFriendlyErrorMessage(err: any, fallback: string): string {
+  const raw = String(err?.message || err || "").trim();
+  if (!raw) return fallback;
+  if (/expected pattern|syntaxerror|getorinsertcomputed/i.test(raw)) {
+    return "Archivo o imagen procesada en modo compatible. Pulsa 'Resolver con IA' de nuevo.";
+  }
+  return raw;
+}
+
 export default function App() {
-  // Landing vs Workspace view (instant 0.1s transition)
   const [showLanding, setShowLanding] = useState<boolean>(true);
 
   const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
@@ -86,24 +110,22 @@ export default function App() {
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   const [styleSettings, setStyleSettings] = useState<StyleSettings>({
-    fontId: "caveat",
+    fontId: "fused-natural-mix",
     inkId: "bic-blue",
+    solveTargetMode: "auto",
+    notebookPaperStyle: "grid",
     organic: {
       enabled: true,
       mistakeRatePercent: 15,
       crossOutRatePercent: 25,
       strokeVariationPercent: 65,
+      antiCloneLetterVariation: true,
     },
   });
 
-  // Universal file input (opens Apple iOS/macOS panel: Fototeca, Hacer foto, Seleccionar archivos)
   const universalFileInputRef = useRef<HTMLInputElement>(null);
-  // Dedicated native mobile camera input
-  const nativeCameraInputRef = useRef<HTMLInputElement>(null);
-
   const allFonts: HandwritingFontOption[] = [...customFonts, ...HANDWRITING_FONTS];
 
-  // Load saved custom fonts & preload sample PDF in the background on mount
   useEffect(() => {
     loadSavedCustomFonts().then((loaded) => {
       if (loaded.length > 0) {
@@ -133,7 +155,7 @@ export default function App() {
       return updated;
     });
     if (styleSettings.fontId === fontId) {
-      setStyleSettings((prev) => ({ ...prev, fontId: "caveat" }));
+      setStyleSettings((prev) => ({ ...prev, fontId: "fused-natural-mix" }));
     }
   };
 
@@ -146,22 +168,56 @@ export default function App() {
       setPdfBytes(copyForExport);
       setPdfFileName(name);
 
-      const renderedPages = await renderPdfToPageImages(bytes, 2.0);
+      const renderedPages = await renderPdfToPageImages(bytes, 1.8);
       setPages(renderedPages);
       setCurrentPage(1);
       setAnnotations([]);
       setSelectedAnnotationId(null);
     } catch (err: any) {
-      console.error("Error loading PDF:", err);
-      setErrorBanner(err?.message || "No se pudo leer el documento.");
+      setErrorBanner(
+        formatFriendlyErrorMessage(err, "No se pudo leer el documento.")
+      );
     } finally {
       setIsLoadingPdf(false);
     }
   };
 
   /**
-   * Handles both PDF files AND one or more Image/Photo files from the Apple sheet or desktop picker.
+   * Loads the user's attached textbook photo (Lope de Vega — La dama boba) with 1 click
+   * and sets mode to auto/notebook so it solves exercises 54–62 on a separate notebook sheet.
    */
+  const handleLoadAttachedBookPhoto = async (autoSolveNow: boolean = false) => {
+    setShowLanding(false);
+    setIsLoadingPdf(true);
+    setErrorBanner(null);
+    try {
+      const result = await loadImagesDirectlyAsPagesAndPdf([
+        ATTACHED_BOOK_IMAGE_PATH,
+      ]);
+      setPdfBytes(result.pdfBytes);
+      setPdfFileName("Lope_de_Vega_La_dama_boba.pdf");
+      setPages(result.pages);
+      setCurrentPage(1);
+      setAnnotations([]);
+      setSelectedAnnotationId(null);
+
+      if (autoSolveNow) {
+        setTimeout(() => {
+          solveSourcePages(result.pages, "notebook");
+        }, 120);
+      }
+    } catch (err: any) {
+      setErrorBanner(
+        formatFriendlyErrorMessage(
+          err,
+          "No se pudo cargar la imagen del libro de literatura."
+        )
+      );
+    } finally {
+      setIsLoadingPdf(false);
+    }
+  };
+
   const handleUniversalFilesSelected = async (
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
@@ -176,34 +232,30 @@ export default function App() {
 
     try {
       const firstFile = files[0];
-      const isPdf =
-        firstFile.type === "application/pdf" ||
-        firstFile.name.toLowerCase().endsWith(".pdf");
+      const firstBuffer = await firstFile.arrayBuffer();
+      const firstBytes = new Uint8Array(firstBuffer);
+      const isRealPdf = isPdfByteSignature(firstBytes);
 
-      if (isPdf) {
-        const buffer = await firstFile.arrayBuffer();
-        await loadPdfFromBytes(new Uint8Array(buffer), firstFile.name);
+      if (isRealPdf) {
+        await loadPdfFromBytes(firstBytes, firstFile.name);
       } else {
-        // Convert 1 or more images/photos into a multi-page PDF document
-        const imageFiles = files.filter(
-          (f) =>
-            f.type.startsWith("image/") ||
-            /\.(jpe?g|png|webp|heic|bmp)$/i.test(f.name)
-        );
-        if (imageFiles.length === 0) {
-          throw new Error(
-            "Selecciona un archivo PDF o una imagen (JPG, PNG, WEBP, HEIC)."
-          );
-        }
-        const convertedBytes = await convertImageFilesToPdfBytes(imageFiles);
-        const baseTitle = imageFiles[0].name.replace(/\.[^.]+$/, "");
-        await loadPdfFromBytes(convertedBytes, `${baseTitle}.pdf`);
+        const result = await loadImagesDirectlyAsPagesAndPdf(files);
+        const baseTitle = firstFile.name.replace(/\.[^.]+$/, "") || "documento";
+        setPdfBytes(result.pdfBytes);
+        setPdfFileName(`${baseTitle}.pdf`);
+        setPages(result.pages);
+        setCurrentPage(1);
+        setAnnotations([]);
+        setSelectedAnnotationId(null);
       }
     } catch (err: any) {
-      console.error("Error procesando archivos:", err);
       setErrorBanner(
-        err?.message || "No se pudo procesar el archivo o imagen seleccionada."
+        formatFriendlyErrorMessage(
+          err,
+          "No se pudo procesar el archivo o imagen seleccionada."
+        )
       );
+    } finally {
       setIsLoadingPdf(false);
     }
   };
@@ -213,10 +265,21 @@ export default function App() {
     setIsLoadingPdf(true);
     setErrorBanner(null);
     try {
-      const convertedBytes = await convertImageFilesToPdfBytes([photoFile]);
-      await loadPdfFromBytes(convertedBytes, photoFile.name.replace(/\.jpg$/i, ".pdf"));
+      const result = await loadImagesDirectlyAsPagesAndPdf([photoFile]);
+      setPdfBytes(result.pdfBytes);
+      setPdfFileName(photoFile.name.replace(/\.jpg$/i, ".pdf"));
+      setPages(result.pages);
+      setCurrentPage(1);
+      setAnnotations([]);
+      setSelectedAnnotationId(null);
     } catch (err: any) {
-      setErrorBanner(err?.message || "No se pudo procesar la foto capturada.");
+      setErrorBanner(
+        formatFriendlyErrorMessage(
+          err,
+          "No se pudo procesar la foto capturada."
+        )
+      );
+    } finally {
       setIsLoadingPdf(false);
     }
   };
@@ -225,23 +288,26 @@ export default function App() {
     setIsLoadingPdf(true);
     setErrorBanner(null);
     try {
-      const sampleBytes = await generateSampleExercisePdf();
-      await loadPdfFromBytes(sampleBytes, "ficha_ejercicios_demo.pdf");
+      const { pdfBytes: sampleBytes, pages: samplePages } =
+        await generateSampleWorksheetDirect();
+      setPdfBytes(sampleBytes);
+      setPdfFileName("ficha_ejercicios_demo.pdf");
+      setPages(samplePages);
+      setCurrentPage(1);
+      setAnnotations([]);
+      setSelectedAnnotationId(null);
       if (autoSolve) {
         setTimeout(() => {
-          solveAllPagesInternal(sampleBytes);
+          solveSourcePages(samplePages);
         }, 100);
       }
     } catch (err: any) {
-      setErrorBanner("Error al generar el PDF de ejemplo.");
+      console.error("Error generating sample worksheet:", err);
+    } finally {
       setIsLoadingPdf(false);
     }
   };
 
-  /**
-   * Assigns organic mistakes and cross-outs across a list of annotations
-   * according to the current organic settings.
-   */
   const applyOrganicDistribution = (
     items: AnswerAnnotation[],
     organicConfig = styleSettings.organic,
@@ -282,16 +348,29 @@ export default function App() {
       .sort((a, b) => a.score - b.score)
       .map((x) => x.idx);
 
-    const indicesByCrossOut = items
+    // Only place crossed-out words ("tachones") in boxes wide enough to fit both the crossed-out word and the answer
+    // Never place a crossed-out word inside a tiny diagram label box (short_blank or narrow box < 24% width)
+    const eligibleForCrossOut = items
       .map((item, idx) => ({
         idx,
+        eligible:
+          Boolean(item.isNotebookEntry) ||
+          (item.subjectType !== "short_blank" &&
+            item.box.width >= 24 &&
+            item.box.height >= 4.2),
         score: seededRandom(item.seed + extraSeedOffset, 29),
       }))
+      .filter((x) => x.eligible)
       .sort((a, b) => a.score - b.score)
       .map((x) => x.idx);
 
     const mistakeSet = new Set(indicesByMistake.slice(0, targetMistakes));
-    const crossOutSet = new Set(indicesByCrossOut.slice(0, targetCrossOuts));
+    const crossOutSet = new Set(
+      eligibleForCrossOut.slice(
+        0,
+        Math.min(targetCrossOuts, eligibleForCrossOut.length)
+      )
+    );
 
     return items.map((ann, idx) => ({
       ...ann,
@@ -301,100 +380,147 @@ export default function App() {
     }));
   };
 
-  const solveSinglePage = async (pageObj: PdfPageData): Promise<AnswerAnnotation[]> => {
-    setPages((prev) =>
-      prev.map((p) =>
-        p.pageNumber === pageObj.pageNumber
-          ? { ...p, status: "solving", errorMessage: undefined }
-          : p
-      )
-    );
-
+  /**
+   * Calls /api/solve-page (served by Express in AI Studio Preview or by public/_worker.js on Cloudflare Pages/Workers).
+   * If deployed on a pure static host (e.g. GitHub Pages or static Cloudflare build without Worker runtime)
+   * where /api/solve-page returns 404/405/missingKey, automatically falls back to calling Gemini REST API directly
+   * with the build-time environment variable (GEMINI_API_KEY / VITE_GEMINI_API_KEY).
+   */
+  const fetchPageSolutionFromApi = async (pageObj: PdfPageData) => {
     const isJpeg = pageObj.imageDataUrl.startsWith("data:image/jpeg");
-
-    const response = await fetch("/api/solve-page", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        imageBase64: pageObj.imageDataUrl,
-        mimeType: isJpeg ? "image/jpeg" : "image/png",
-        pageNumber: pageObj.pageNumber,
-        customInstructions: customInstructions.trim() || undefined,
-      }),
+    const mimeType = isJpeg ? "image/jpeg" : "image/png";
+    const payload = JSON.stringify({
+      imageBase64: pageObj.imageDataUrl,
+      mimeType,
+      pageNumber: pageObj.pageNumber,
+      customInstructions: customInstructions.trim() || undefined,
     });
 
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || "Error al resolver la página con Gemini.");
+    let serverStatus = 0;
+    let rawText = "";
+    let networkFailed = false;
+
+    try {
+      const res = await new Promise<{ status: number; rawText: string }>(
+        (resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("POST", "/api/solve-page", true);
+          xhr.setRequestHeader("Content-Type", "application/json");
+          xhr.timeout = 45000;
+          xhr.onload = () => {
+            resolve({
+              status: xhr.status,
+              rawText: xhr.responseText || "",
+            });
+          };
+          xhr.onerror = () => {
+            reject(new Error("Network error"));
+          };
+          xhr.ontimeout = () => {
+            reject(
+              new Error(
+                "Tiempo de espera agotado al analizar la página. Pulsa 'Resolver con IA' de nuevo."
+              )
+            );
+          };
+          xhr.send(payload);
+        }
+      );
+      serverStatus = res.status;
+      rawText = res.rawText;
+    } catch {
+      networkFailed = true;
     }
 
-    const rawExercises = Array.isArray(data.exercises) ? data.exercises : [];
-    const createdAnnotations: AnswerAnnotation[] = rawExercises.map(
-      (ex: any, index: number) => {
-        const box2d =
-          Array.isArray(ex.blankBox2d) && ex.blankBox2d.length === 4
-            ? ex.blankBox2d
-            : [150 + index * 110, 80, 210 + index * 110, 850];
-
-        const [ymin, xmin, ymax, xmax] = box2d;
-        const xPercent = Math.max(1, Math.min(92, xmin / 10));
-        const yPercent = Math.max(1, Math.min(94, ymin / 10));
-        const widthPercent = Math.max(8, Math.min(96 - xPercent, (xmax - xmin) / 10));
-        const heightPercent = Math.max(2.8, Math.min(30, (ymax - ymin) / 10));
-
-        return {
-          id: `p${pageObj.pageNumber}-ex${index + 1}-${Date.now()}`,
-          pageNumber: pageObj.pageNumber,
-          questionLabel: ex.questionLabel || `Ej. ${index + 1}`,
-          questionSummary: ex.questionSummary || "Ejercicio detectado",
-          subjectType: ex.subjectType || "open_text",
-          correctAnswer: String(ex.correctAnswer || "").trim(),
-          organicMistakeAnswer: String(
-            ex.organicMistakeAnswer || ex.correctAnswer || ""
-          ).trim(),
-          mistakeExplanation: String(
-            ex.mistakeExplanation || "Pequeño desliz humano simulado"
-          ).trim(),
-          crossedOutWord: String(ex.crossedOutWord || "").trim(),
-          customText: null,
-          box: {
-            x: Number(xPercent.toFixed(2)),
-            y: Number(yPercent.toFixed(2)),
-            width: Number(widthPercent.toFixed(2)),
-            height: Number(heightPercent.toFixed(2)),
-          },
-          useMistake: false,
-          useCrossOut: false,
-          autoFitFont: true,
-          manualFontSize: 16,
-          seed: pageObj.pageNumber * 100 + index * 17 + 1,
-        };
+    let data: any = null;
+    if (!networkFailed && rawText) {
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        data = null;
       }
+    }
+
+    // Success from /api/solve-page (Express server.ts or Cloudflare _worker.js)
+    if (
+      !networkFailed &&
+      serverStatus >= 200 &&
+      serverStatus < 300 &&
+      data &&
+      Array.isArray(data.exercises)
+    ) {
+      return data;
+    }
+
+    // If /api/solve-page returned 404, 405, non-JSON HTML (static hosting), or missing runtime key,
+    // try the build-time key fallback (VITE_GEMINI_API_KEY / GEMINI_API_KEY)
+    const buildTimeKey = getBuildTimeGeminiKey();
+    if (buildTimeKey) {
+      return await solvePageViaDirectRestApi({
+        apiKey: buildTimeKey,
+        imageBase64: pageObj.imageDataUrl,
+        mimeType,
+        pageNumber: pageObj.pageNumber,
+        customInstructions: customInstructions.trim() || undefined,
+      });
+    }
+
+    if (serverStatus === 404 || serverStatus === 405 || !data) {
+      throw new Error(
+        "En Cloudflare Workers/Pages o GitHub: asegúrate de subir el último commit (con public/_worker.js y wrangler.toml) y añadir la variable GEMINI_API_KEY en Settings → Variables and Secrets."
+      );
+    }
+
+    throw new Error(
+      data?.error ||
+        "Error al resolver la página. En Cloudflare/GitHub verifica que GEMINI_API_KEY esté configurada en Variables and Secrets."
     );
-
-    const distributed = applyOrganicDistribution(createdAnnotations);
-
-    setPages((prev) =>
-      prev.map((p) =>
-        p.pageNumber === pageObj.pageNumber
-          ? {
-              ...p,
-              status: "solved",
-              pageSummary: data.pageSummary || "Hoja de ejercicios resuelta",
-            }
-          : p
-      )
-    );
-
-    return distributed;
   };
 
-  const solveAllPagesInternal = async (_overrideBytes?: Uint8Array) => {
-    if (pages.length === 0 || isSolvingAll) return;
+  /**
+   * Re-runs the pixel-level blank refiner on the active page's annotations with 1 click
+   * so boxes snap cleanly into empty white spaces and never overlap printed question lines.
+   */
+  const handleAutoRefineCurrentPageBoxes = async () => {
+    const activePageObj = pages.find((p) => p.pageNumber === currentPage);
+    if (!activePageObj || activePageObj.isNotebookPage) return;
+
+    const pageAnns = annotations.filter((a) => a.pageNumber === currentPage);
+    if (pageAnns.length === 0) return;
+
+    const refined = await refinePageAnnotationsWithPixels(
+      activePageObj.imageDataUrl,
+      pageAnns
+    );
+    setAnnotations((prev) =>
+      prev.map((ann) => {
+        if (ann.pageNumber !== currentPage) return ann;
+        return refined.find((r) => r.id === ann.id) || ann;
+      })
+    );
+  };
+
+  /**
+   * Solves all original source pages (ignoring already-generated notebook pages)
+   * and either places answers in-place OR generates separate notebook pages ("En tu cuaderno aparte").
+   */
+  const solveSourcePages = async (
+    overrideSourcePages?: PdfPageData[],
+    forceMode?: SolveTargetMode
+  ) => {
+    const baseSourcePages = (overrideSourcePages || pages).filter(
+      (p) => !p.isNotebookPage
+    );
+    if (baseSourcePages.length === 0 || isSolvingAll) return;
+
+    const activeTargetMode = forceMode || styleSettings.solveTargetMode;
     setIsSolvingAll(true);
     setErrorBanner(null);
 
-    const total = pages.length;
+    // Reset any previously generated notebook pages before re-solving
+    setPages(baseSourcePages.map((p) => ({ ...p, status: "idle" })));
+
+    const total = baseSourcePages.length;
     setSolvingProgress({
       active: true,
       currentPage: 1,
@@ -404,27 +530,139 @@ export default function App() {
     });
 
     try {
-      let accumulated: AnswerAnnotation[] = [
-        ...annotations.filter((a) => !pages.some((p) => p.pageNumber === a.pageNumber)),
-      ];
+      let currentPagesList: PdfPageData[] = [...baseSourcePages];
+      let accumulatedAnnotations: AnswerAnnotation[] = [];
+      let firstCreatedNotebookPageNum: number | null = null;
 
-      for (let i = 0; i < pages.length; i++) {
-        const pageObj = pages[i];
+      for (let i = 0; i < baseSourcePages.length; i++) {
+        const pageObj = baseSourcePages[i];
         setCurrentPage(pageObj.pageNumber);
+        setPages((prev) =>
+          prev.map((p) =>
+            p.pageNumber === pageObj.pageNumber ? { ...p, status: "solving" } : p
+          )
+        );
+
         setSolvingProgress({
           active: true,
           currentPage: i + 1,
           totalPages: total,
           completedPages: i,
-          statusText: `Resolviendo página ${i + 1} de ${total} · Detectando zonas en blanco...`,
+          statusText: `Resolviendo página ${i + 1} de ${total} · Analizando ejercicios y ajustando huecos...`,
         });
 
-        const pageSolved = await solveSinglePage(pageObj);
-        accumulated = [
-          ...accumulated.filter((a) => a.pageNumber !== pageObj.pageNumber),
-          ...pageSolved,
-        ];
-        setAnnotations([...accumulated]);
+        const data = await fetchPageSolutionFromApi(pageObj);
+        const rawExercises = Array.isArray(data.exercises) ? data.exercises : [];
+        const pageTitle = data.pageSummary || `Página ${pageObj.pageNumber}`;
+
+        const useSeparateNotebook =
+          activeTargetMode === "notebook" ||
+          (activeTargetMode === "auto" && Boolean(data.requiresSeparateNotebook));
+
+        if (useSeparateNotebook && rawExercises.length > 0) {
+          // Build separate notebook page(s) for this textbook page!
+          const nextPageNumber = currentPagesList.length + 1;
+          const { notebookPages, notebookAnnotations } =
+            buildNotebookPagesForExercises(
+              rawExercises,
+              nextPageNumber,
+              pageObj.pageNumber,
+              pageTitle,
+              styleSettings.notebookPaperStyle
+            );
+
+          if (firstCreatedNotebookPageNum === null && notebookPages.length > 0) {
+            firstCreatedNotebookPageNum = notebookPages[0].pageNumber;
+          }
+
+          const distributed = applyOrganicDistribution(notebookAnnotations);
+          currentPagesList = currentPagesList
+            .map((p) =>
+              p.pageNumber === pageObj.pageNumber
+                ? { ...p, status: "solved" as const, pageSummary: pageTitle }
+                : p
+            )
+            .concat(notebookPages);
+
+          accumulatedAnnotations = [...accumulatedAnnotations, ...distributed];
+          setPages([...currentPagesList]);
+          setAnnotations([...accumulatedAnnotations]);
+        } else {
+          // Place answers directly in the blank spaces of the worksheet
+          const inPlaceAnnotations: AnswerAnnotation[] = rawExercises.map(
+            (ex: any, index: number) => {
+              const box2d =
+                Array.isArray(ex.blankBox2d) && ex.blankBox2d.length === 4
+                  ? ex.blankBox2d
+                  : [150 + index * 110, 80, 210 + index * 110, 850];
+
+              const [ymin, xmin, ymax, xmax] = box2d;
+              const rawW = (xmax - xmin) / 10;
+              const rawH = (ymax - ymin) / 10;
+              const isSmallLabel =
+                ex.subjectType === "short_blank" ||
+                (rawW <= 26 && rawH <= 6.5);
+
+              const xPercent = Math.max(0.8, Math.min(93, xmin / 10));
+              const yPercent = Math.max(0.8, Math.min(95, ymin / 10));
+              const widthPercent = Math.max(
+                isSmallLabel ? 5.5 : 8,
+                Math.min(96.5 - xPercent, rawW)
+              );
+              const heightPercent = Math.max(
+                isSmallLabel ? 1.9 : 2.6,
+                Math.min(32, rawH)
+              );
+
+              return {
+                id: `p${pageObj.pageNumber}-ex${index + 1}-${Date.now()}`,
+                pageNumber: pageObj.pageNumber,
+                questionLabel: ex.questionLabel || `Ej. ${index + 1}`,
+                questionSummary: ex.questionSummary || "Ejercicio detectado",
+                subjectType: isSmallLabel
+                  ? "short_blank"
+                  : ex.subjectType || "open_text",
+                correctAnswer: String(ex.correctAnswer || "").trim(),
+                organicMistakeAnswer: String(
+                  ex.organicMistakeAnswer || ex.correctAnswer || ""
+                ).trim(),
+                mistakeExplanation: String(
+                  ex.mistakeExplanation || "Pequeño desliz humano simulado"
+                ).trim(),
+                crossedOutWord: String(ex.crossedOutWord || "").trim(),
+                customText: null,
+                box: {
+                  x: Number(xPercent.toFixed(2)),
+                  y: Number(yPercent.toFixed(2)),
+                  width: Number(widthPercent.toFixed(2)),
+                  height: Number(heightPercent.toFixed(2)),
+                },
+                useMistake: false,
+                useCrossOut: false,
+                autoFitFont: true,
+                manualFontSize: 15,
+                seed: pageObj.pageNumber * 100 + index * 17 + 1,
+              };
+            }
+          );
+
+          // Refine every box against the actual worksheet pixels so diagram boxes snap to their white cavity
+          // and open-text boxes with a printed question line inside the top border shift below the printed question!
+          const pixelRefined = await refinePageAnnotationsWithPixels(
+            pageObj.imageDataUrl,
+            inPlaceAnnotations
+          );
+          const distributed = applyOrganicDistribution(pixelRefined);
+
+          currentPagesList = currentPagesList.map((p) =>
+            p.pageNumber === pageObj.pageNumber
+              ? { ...p, status: "solved" as const, pageSummary: pageTitle }
+              : p
+          );
+          accumulatedAnnotations = [...accumulatedAnnotations, ...distributed];
+          setPages([...currentPagesList]);
+          setAnnotations([...accumulatedAnnotations]);
+        }
 
         setSolvingProgress({
           active: true,
@@ -438,11 +676,18 @@ export default function App() {
         });
       }
 
+      // If separate notebook sheets were generated, automatically jump to the first notebook page so the user sees the handwritten answers immediately!
+      if (firstCreatedNotebookPageNum !== null) {
+        setCurrentPage(firstCreatedNotebookPageNum);
+      }
+
       setActiveSidebarTab("exercises");
     } catch (err: any) {
-      console.error("Error solving PDF:", err);
       setErrorBanner(
-        err?.message || "No se pudieron resolver los ejercicios. Inténtalo de nuevo."
+        formatFriendlyErrorMessage(
+          err,
+          "No se pudieron resolver los ejercicios. Inténtalo de nuevo."
+        )
       );
       setPages((prev) =>
         prev.map((p) => (p.status === "solving" ? { ...p, status: "error" } : p))
@@ -455,46 +700,31 @@ export default function App() {
     }
   };
 
-  const handleSolveCurrentPage = async () => {
-    const pageObj = pages.find((p) => p.pageNumber === currentPage);
-    if (!pageObj || isSolvingAll) return;
-    setIsSolvingAll(true);
-    setErrorBanner(null);
-    setSolvingProgress({
-      active: true,
-      currentPage: 1,
-      totalPages: 1,
-      completedPages: 0,
-      statusText: `Resolviendo página ${currentPage} con ritaGPT...`,
-    });
+  /**
+   * Updates the background paper style of any existing generated notebook pages in real time
+   */
+  const handleChangeNotebookPaperStyle = (nextPaper: NotebookPaperStyle) => {
+    setStyleSettings((prev) => ({
+      ...prev,
+      notebookPaperStyle: nextPaper,
+    }));
 
-    try {
-      const pageSolved = await solveSinglePage(pageObj);
-      setAnnotations((prev) => [
-        ...prev.filter((a) => a.pageNumber !== currentPage),
-        ...pageSolved,
-      ]);
-      setSolvingProgress({
-        active: true,
-        currentPage: 1,
-        totalPages: 1,
-        completedPages: 1,
-        statusText: `Página ${currentPage} completada`,
+    setPages((prev) => {
+      let nbCounter = 0;
+      return prev.map((p) => {
+        if (!p.isNotebookPage) return p;
+        nbCounter += 1;
+        const bg = generateNotebookBackgroundDataUrl(
+          nextPaper,
+          p.pageSummary || "Cuaderno ritaGPT",
+          nbCounter
+        );
+        return {
+          ...p,
+          imageDataUrl: bg.imageDataUrl,
+        };
       });
-      setActiveSidebarTab("exercises");
-    } catch (err: any) {
-      setErrorBanner(err?.message || "Error al resolver esta página.");
-      setPages((prev) =>
-        prev.map((p) =>
-          p.pageNumber === currentPage ? { ...p, status: "error" } : p
-        )
-      );
-    } finally {
-      setIsSolvingAll(false);
-      setTimeout(() => {
-        setSolvingProgress((prev) => ({ ...prev, active: false }));
-      }, 900);
-    }
+    });
   };
 
   const handleUpdateAnnotation = (
@@ -526,19 +756,21 @@ export default function App() {
       questionLabel: `Nota ${pageCount + 1}`,
       questionSummary: "Respuesta añadida manualmente",
       subjectType: "open_text",
-      correctAnswer: "x = 12 (Respuesta manual)",
-      organicMistakeAnswer: "x = 11",
+      correctAnswer: "Respuesta escrita a mano",
+      organicMistakeAnswer: "Respuesta con leve fallo",
       mistakeExplanation: "Variante manual editable",
-      crossedOutWord: "x=10",
+      crossedOutWord: "error",
       customText: null,
       box: {
         x: Number(xPercent.toFixed(2)),
         y: Number(yPercent.toFixed(2)),
-        width: 34,
-        height: 5.5,
+        width: 38,
+        height: 6,
       },
       useMistake: false,
-      useCrossOut: styleSettings.organic.enabled && styleSettings.organic.crossOutRatePercent >= 30,
+      useCrossOut:
+        styleSettings.organic.enabled &&
+        styleSettings.organic.crossOutRatePercent >= 30,
       autoFitFont: true,
       manualFontSize: 16,
       seed: Math.floor(Math.random() * 1000) + 1,
@@ -573,17 +805,18 @@ export default function App() {
     );
   };
 
-  const handleDownloadPdf = async () => {
-    if (!pdfBytes || pages.length === 0 || isExporting) return;
+  const handleDownloadPdf = async (onlyNotebook: boolean = false) => {
+    if (pages.length === 0 || isExporting) return;
     setIsExporting(true);
     setErrorBanner(null);
     try {
       const modifiedBytes = await exportAnnotatedPdfBytes(
-        pdfBytes,
+        pdfBytes || new Uint8Array(0),
         pages,
         annotations,
         styleSettings,
-        allFonts
+        allFonts,
+        onlyNotebook
       );
       const blob = new Blob([modifiedBytes as unknown as BlobPart], {
         type: "application/pdf",
@@ -592,23 +825,31 @@ export default function App() {
       const link = document.createElement("a");
       const baseName = pdfFileName.replace(/\.pdf$/i, "");
       link.href = url;
-      link.download = `${baseName}_ritaGPT_manuscrito.pdf`;
+      link.download = onlyNotebook
+        ? `${baseName}_cuaderno_aparte_ritaGPT.pdf`
+        : `${baseName}_ritaGPT_manuscrito.pdf`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
     } catch (err: any) {
-      console.error("Export error:", err);
-      setErrorBanner(err?.message || "Error al generar el archivo PDF final.");
+      setErrorBanner(
+        formatFriendlyErrorMessage(
+          err,
+          "Error al generar el archivo PDF final."
+        )
+      );
     } finally {
       setIsExporting(false);
     }
   };
 
-  const activePageData = pages.find((p) => p.pageNumber === currentPage) || pages[0];
+  const activePageData =
+    pages.find((p) => p.pageNumber === currentPage) || pages[0];
   const currentPageAnnotations = annotations.filter(
     (a) => a.pageNumber === currentPage
   );
+  const hasNotebookPages = pages.some((p) => p.isNotebookPage);
 
   const totalMistakesCount = annotations.filter((a) => a.useMistake).length;
   const totalCrossOutsCount = annotations.filter((a) => a.useCrossOut).length;
@@ -617,7 +858,8 @@ export default function App() {
     solvingProgress.totalPages > 0
       ? Math.round(
           ((solvingProgress.completedPages +
-            (isSolvingAll && solvingProgress.completedPages < solvingProgress.totalPages
+            (isSolvingAll &&
+            solvingProgress.completedPages < solvingProgress.totalPages
               ? 0.35
               : 0)) /
             solvingProgress.totalPages) *
@@ -632,22 +874,12 @@ export default function App() {
         ref={universalFileInputRef}
         type="file"
         multiple
-        accept="application/pdf,image/*,.pdf,.jpg,.jpeg,.png,.heic,.webp"
+        accept="application/pdf,image/jpeg,image/png,image/webp,image/*,.pdf,.jpg,.jpeg,.png"
         onChange={handleUniversalFilesSelected}
         className="hidden"
       />
 
-      {/* Direct Mobile Camera Capture Input */}
-      <input
-        ref={nativeCameraInputRef}
-        type="file"
-        accept="image/*"
-        capture="environment"
-        onChange={handleUniversalFilesSelected}
-        className="hidden"
-      />
-
-      {/* Custom Font Creator & Uploader Modal */}
+      {/* Custom Font Creator & Multi-Font Fusion Modal */}
       <CustomFontStudioModal
         isOpen={isFontStudioOpen}
         onClose={() => setIsFontStudioOpen(false)}
@@ -665,7 +897,7 @@ export default function App() {
 
       {/* Top Bar Contract: Strictly 3 zones separated by gap-8 */}
       <header className="h-15 bg-white border-b border-slate-200 px-6 flex items-center justify-between gap-8 shrink-0 z-30">
-        {/* Zone 1: Brand Title (single text element wordmark) */}
+        {/* Zone 1: Brand Title */}
         <a
           href="#ritaGPT"
           onClick={(e) => {
@@ -688,23 +920,23 @@ export default function App() {
           </button>
           <button
             type="button"
-            onClick={() => setIsCameraModalOpen(true)}
-            className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            onClick={() => handleLoadAttachedBookPhoto(true)}
+            className="hover:text-blue-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Hacer Foto
+            Ejemplo Libro en Cuaderno
           </button>
           <button
             type="button"
             onClick={() => setIsFontStudioOpen(true)}
             className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Mi Propia Fuente
+            Fusionar Mis Fuentes
           </button>
           <button
             type="button"
             onClick={() => {
               setShowLanding(false);
-              solveAllPagesInternal();
+              solveSourcePages();
             }}
             disabled={isSolvingAll || pages.length === 0}
             className="hover:text-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
@@ -727,7 +959,7 @@ export default function App() {
           ) : (
             <button
               type="button"
-              onClick={handleDownloadPdf}
+              onClick={() => handleDownloadPdf(false)}
               disabled={!pdfBytes || isExporting || pages.length === 0}
               className="px-4 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer shadow-xs"
             >
@@ -753,14 +985,18 @@ export default function App() {
                 ·
               </span>
               <span className="font-mono-tabular text-blue-300">
-                Página {solvingProgress.currentPage} de {solvingProgress.totalPages} (
-                {solvingProgress.totalPages - solvingProgress.completedPages} restantes)
+                Página {solvingProgress.currentPage} de{" "}
+                {solvingProgress.totalPages} (
+                {solvingProgress.totalPages - solvingProgress.completedPages}{" "}
+                restantes)
               </span>
             </div>
             <div className="flex items-center gap-3 sm:w-64">
               <div className="flex-1 h-2 bg-slate-800 rounded-full overflow-hidden">
                 <div
-                  style={{ width: `${Math.min(100, Math.max(8, progressPercentage))}%` }}
+                  style={{
+                    width: `${Math.min(100, Math.max(8, progressPercentage))}%`,
+                  }}
                   className="h-full bg-blue-500 transition-all duration-200 rounded-full"
                 />
               </div>
@@ -797,7 +1033,7 @@ export default function App() {
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-center pb-14 border-b border-slate-200">
               <div className="lg:col-span-7 space-y-6">
                 <div className="text-xs font-medium text-slate-500">
-                  Resolución Espacial con Gemini Vision · Caligrafía Humana Orgánica · Exportación PDF
+                  Rellenador de PDFs · Cuaderno Aparte para Libros · Fusión de Fuentes Anti-Clon
                 </div>
 
                 <h1
@@ -808,7 +1044,7 @@ export default function App() {
                 </h1>
 
                 <p className="text-base sm:text-lg text-slate-600 max-w-2xl leading-relaxed">
-                  Sube cualquier hoja de ejercicios en <strong>PDF</strong>, selecciona una <strong>imagen de tu galería</strong> o <strong>haz una foto al instante</strong>. ritaGPT resuelve cada ejercicio y escribe las respuestas directamente sobre los huecos en blanco con tu propia letra manuscrita, fallos humanos opcionales y tachones naturales.
+                  Sube una <strong>ficha con huecos</strong> o la <strong>foto de una página de libro</strong> (como literatura o historia). ritaGPT detecta si debe escribir sobre los huecos o generar <strong>hojas de cuaderno aparte</strong> con todas las respuestas a mano, fusionando varias fuentes para que dos letras repetidas (como dos <em>"a"</em>) nunca sean iguales.
                 </p>
 
                 {/* Instant 0.1s Entry CTA + Secondary Quick Actions */}
@@ -833,11 +1069,11 @@ export default function App() {
 
                   <button
                     type="button"
-                    onClick={() => setIsCameraModalOpen(true)}
-                    className="px-4 py-3.5 bg-white hover:bg-slate-100 text-slate-800 border border-slate-200 text-sm font-medium rounded-xl transition-colors duration-75 flex items-center gap-2 cursor-pointer whitespace-nowrap"
+                    onClick={() => handleLoadAttachedBookPhoto(true)}
+                    className="px-4 py-3.5 bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold rounded-xl transition-colors duration-75 flex items-center gap-2 cursor-pointer whitespace-nowrap"
                   >
-                    <Camera className="w-4 h-4 text-slate-700" />
-                    <span>Hacer Foto</span>
+                    <BookOpen className="w-4 h-4 text-blue-300" />
+                    <span>Resolver Foto "La dama boba" en Cuaderno</span>
                   </button>
                 </div>
               </div>
@@ -846,31 +1082,39 @@ export default function App() {
               <div className="lg:col-span-5 bg-white border border-slate-200 rounded-2xl p-6 shadow-xs space-y-4">
                 <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                   <span className="text-xs font-semibold text-slate-900">
-                    Demostración Caligráfica en Vivo
+                    Fusión Multi-Fuente + Cuaderno Aparte
                   </span>
                   <span className="text-xs font-mono-tabular text-slate-500">
-                    Auto-Fit · Modo Orgánico
+                    Anti-Clon Activo
                   </span>
                 </div>
 
-                <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
-                  <p className="text-xs text-slate-700 font-medium">
-                    1. Resuelve la ecuación: 3(2x - 4) + 6 = 18
-                  </p>
-                  <div className="bg-white border border-dashed border-blue-400 rounded-lg p-3">
-                    <p
-                      style={{
-                        fontFamily: "'Caveat', cursive",
-                        color: "#183B8C",
-                        fontSize: "23px",
-                        transform: "rotate(-0.7deg)",
-                      }}
-                      className="leading-tight"
-                    >
-                      <span className="line-through opacity-75 mr-2">6x=18</span>
-                      6x - 12 + 6 = 18 → 6x = 24 → x = 4
-                    </p>
+                {/* Notebook Grid Preview */}
+                <div className="bg-[#FCFBF7] border border-slate-200 rounded-xl p-4 space-y-2 relative overflow-hidden">
+                  <div className="text-[11px] font-mono-tabular text-slate-500 border-b border-red-200 pb-1">
+                    Lope de Vega: La dama boba · Actividades en el cuaderno
                   </div>
+                  <p className="text-xl text-[#183B8C] leading-snug pt-1">
+                    {"54) El teatro dependía de la clase social; hoy depende del precio de la entrada.".split(
+                      ""
+                    ).map((ch, idx) => {
+                      const families = [
+                        "'Caveat', cursive",
+                        "'Kalam', cursive",
+                        "'Patrick Hand', cursive",
+                      ];
+                      return (
+                        <span
+                          key={idx}
+                          style={{
+                            fontFamily: families[idx % families.length],
+                          }}
+                        >
+                          {ch}
+                        </span>
+                      );
+                    })}
+                  </p>
                 </div>
 
                 <div className="flex items-center justify-between pt-1">
@@ -879,18 +1123,16 @@ export default function App() {
                     onClick={() => setIsFontStudioOpen(true)}
                     className="text-xs font-semibold text-blue-700 hover:underline flex items-center gap-1.5 cursor-pointer"
                   >
-                    <PenTool className="w-3.5 h-3.5" />
-                    <span>Crear o subir mi propia letra →</span>
+                    <Layers className="w-3.5 h-3.5" />
+                    <span>Subir y fusionar varias fuentes →</span>
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      setShowLanding(false);
-                      solveAllPagesInternal();
-                    }}
-                    className="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                    onClick={() => setIsCameraModalOpen(true)}
+                    className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium rounded-lg flex items-center gap-1.5 cursor-pointer"
                   >
-                    Probar Demo Ahora
+                    <Camera className="w-3.5 h-3.5" />
+                    <span>Hacer Foto</span>
                   </button>
                 </div>
               </div>
@@ -905,29 +1147,49 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
                 {/* Card 1 */}
                 <div
-                  onClick={() => {
-                    setShowLanding(false);
-                  }}
+                  onClick={() => handleLoadAttachedBookPhoto(true)}
                   className="bg-white border border-slate-200 hover:border-slate-300 rounded-xl p-5 flex flex-col justify-between cursor-pointer transition-colors"
                 >
                   <div>
                     <div className="w-9 h-9 rounded-lg bg-blue-50 text-blue-700 flex items-center justify-center mb-3">
-                      <Wand2 className="w-4 h-4" />
+                      <BookOpen className="w-4 h-4" />
                     </div>
                     <h3 className="font-display text-sm font-bold text-slate-900 mb-1.5">
-                      01. Resolver PDFs con IA
+                      01. Hojas de Libro → Cuaderno Aparte
                     </h3>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Detecta automáticamente las coordenadas de las zonas en blanco en matemáticas, física, inglés o historia y escribe la respuesta con auto-ajuste de fuente.
+                      Si subes una foto de un libro cuyos ejercicios dicen "Hazlo en tu cuaderno", ritaGPT crea hojas de cuaderno cuadriculadas o rayadas aparte con todas las respuestas numeradas.
                     </p>
                   </div>
                   <div className="mt-4 pt-3 border-t border-slate-100 text-xs font-semibold text-blue-700 flex items-center justify-between">
-                    <span>Abrir visor PDF</span>
+                    <span>Probar con "La dama boba"</span>
                     <ArrowRight className="w-3.5 h-3.5" />
                   </div>
                 </div>
 
                 {/* Card 2 */}
+                <div
+                  onClick={() => setIsFontStudioOpen(true)}
+                  className="bg-white border border-slate-200 hover:border-slate-300 rounded-xl p-5 flex flex-col justify-between cursor-pointer transition-colors"
+                >
+                  <div>
+                    <div className="w-9 h-9 rounded-lg bg-blue-50 text-blue-700 flex items-center justify-center mb-3">
+                      <Layers className="w-4 h-4" />
+                    </div>
+                    <h3 className="font-display text-sm font-bold text-slate-900 mb-1.5">
+                      02. Fusión de Varias Fuentes (Anti-Clon)
+                    </h3>
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      Sube varias fuentes (.TTF/.OTF) o dibuja hasta 3 variantes de cada letra para fusionarlas. Así ninguna letra "a" repetida tendrá el mismo trazo.
+                    </p>
+                  </div>
+                  <div className="mt-4 pt-3 border-t border-slate-100 text-xs font-semibold text-blue-700 flex items-center justify-between">
+                    <span>Fusionar mis fuentes</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </div>
+                </div>
+
+                {/* Card 3 */}
                 <div
                   onClick={() => universalFileInputRef.current?.click()}
                   className="bg-white border border-slate-200 hover:border-slate-300 rounded-xl p-5 flex flex-col justify-between cursor-pointer transition-colors"
@@ -937,36 +1199,14 @@ export default function App() {
                       <ImageIcon className="w-4 h-4" />
                     </div>
                     <h3 className="font-display text-sm font-bold text-slate-900 mb-1.5">
-                      02. Fotos, Cámara y Panel Apple
+                      03. PDFs, Fotos y Cámara Apple
                     </h3>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Abre el menú nativo de tu dispositivo (Fototeca, Hacer Foto en directo o Archivos de iCloud/Drive). Convierte fotos de cuadernos o exámenes en PDF al instante.
+                      Abre el menú nativo de tu dispositivo (Fototeca, Hacer Foto o Archivos). Rellena huecos directamente encima de fichas o genera hojas de cuaderno.
                     </p>
                   </div>
                   <div className="mt-4 pt-3 border-t border-slate-100 text-xs font-semibold text-blue-700 flex items-center justify-between">
-                    <span>Subir imagen o hacer foto</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </div>
-                </div>
-
-                {/* Card 3 */}
-                <div
-                  onClick={() => setIsFontStudioOpen(true)}
-                  className="bg-white border border-slate-200 hover:border-slate-300 rounded-xl p-5 flex flex-col justify-between cursor-pointer transition-colors"
-                >
-                  <div>
-                    <div className="w-9 h-9 rounded-lg bg-blue-50 text-blue-700 flex items-center justify-center mb-3">
-                      <PenTool className="w-4 h-4" />
-                    </div>
-                    <h3 className="font-display text-sm font-bold text-slate-900 mb-1.5">
-                      03. Creador y Subida de Tu Fuente
-                    </h3>
-                    <p className="text-xs text-slate-600 leading-relaxed">
-                      Dibuja tus propias letras y números directamente en la web o sube tu archivo `.TTF` / `.OTF`. Se guarda en la memoria del navegador para todos tus ejercicios.
-                    </p>
-                  </div>
-                  <div className="mt-4 pt-3 border-t border-slate-100 text-xs font-semibold text-blue-700 flex items-center justify-between">
-                    <span>Abrir estudio de letra</span>
+                    <span>Subir archivo o foto</span>
                     <ArrowRight className="w-3.5 h-3.5" />
                   </div>
                 </div>
@@ -1000,38 +1240,34 @@ export default function App() {
           </div>
         </main>
       ) : (
-        /* VIEW 2: FULL WORKSPACE (PDF & PHOTO EDITOR + ORGANIC HANDWRITING) */
+        /* VIEW 2: FULL WORKSPACE (PDF & PHOTO EDITOR + SEPARATE NOTEBOOK + FUSED HANDWRITING) */
         <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
           {/* LEFT ZONE (70%): Interactive PDF Preview & Canvas Stage */}
           <main className="flex-1 flex flex-col bg-slate-100/80 overflow-hidden">
             {/* Workspace Sub-Toolbar */}
             <div className="bg-white border-b border-slate-200 px-5 py-2.5 flex flex-wrap items-center justify-between gap-4">
-              {/* Left: File & Page Metadata (unboxed clean text with · separators) */}
+              {/* Left: File & Page Metadata */}
               <div className="flex items-center gap-2 text-xs text-slate-600">
                 <FileText className="w-4 h-4 text-slate-400 shrink-0" />
-                <span className="font-medium text-slate-900 truncate max-w-[180px]">
+                <span className="font-medium text-slate-900 truncate max-w-[170px]">
                   {pdfFileName}
                 </span>
                 <span aria-hidden="true">·</span>
                 <span className="font-mono-tabular">
-                  {pages.length} {pages.length === 1 ? "página" : "páginas"}
+                  Pág. {currentPage}/{pages.length}
                 </span>
+                {activePageData?.isNotebookPage && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-semibold text-blue-700">
+                      Hoja de Cuaderno Aparte
+                    </span>
+                  </>
+                )}
                 <span aria-hidden="true">·</span>
                 <span className="font-mono-tabular">
                   {annotations.length} respuestas
                 </span>
-                {styleSettings.organic.enabled && annotations.length > 0 && (
-                  <>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-mono-tabular text-amber-700">
-                      {totalMistakesCount} fallos
-                    </span>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-mono-tabular text-blue-700">
-                      {totalCrossOutsCount} tachones
-                    </span>
-                  </>
-                )}
               </div>
 
               {/* Right: Canvas Manipulation Controls */}
@@ -1039,7 +1275,6 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => universalFileInputRef.current?.click()}
-                  title="Abre el selector de archivos, Fototeca o cámara de tu dispositivo"
                   className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <Upload className="w-3.5 h-3.5" />
@@ -1048,17 +1283,17 @@ export default function App() {
 
                 <button
                   type="button"
-                  onClick={() => setIsCameraModalOpen(true)}
-                  title="Hacer foto a una hoja de ejercicios"
+                  onClick={() => handleLoadAttachedBookPhoto(false)}
+                  title="Cargar la foto del libro La dama boba para resolver en cuaderno aparte"
                   className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  <Camera className="w-3.5 h-3.5" />
-                  <span>Hacer Foto</span>
+                  <BookOpen className="w-3.5 h-3.5 text-blue-700" />
+                  <span>Foto Libro Demo</span>
                 </button>
 
                 <button
                   type="button"
-                  onClick={() => solveAllPagesInternal()}
+                  onClick={() => solveSourcePages()}
                   disabled={isSolvingAll || pages.length === 0}
                   className="px-3.5 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                 >
@@ -1067,10 +1302,35 @@ export default function App() {
                     {isSolvingAll
                       ? `Resolviendo (${solvingProgress.currentPage}/${solvingProgress.totalPages})...`
                       : annotations.length > 0
-                      ? "Re-Analizar Hoja"
+                      ? "Re-Analizar"
                       : "Resolver con IA"}
                   </span>
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => solveSourcePages(undefined, "notebook")}
+                  disabled={isSolvingAll || pages.length === 0}
+                  title="Resuelve todos los ejercicios de la imagen en hojas de cuaderno aparte"
+                  className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 disabled:opacity-50 rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <BookOpen className="w-3.5 h-3.5" />
+                  <span>Resolver en Cuaderno Aparte</span>
+                </button>
+
+                {annotations.some(
+                  (a) => a.pageNumber === currentPage && !a.isNotebookEntry
+                ) && (
+                  <button
+                    type="button"
+                    onClick={handleAutoRefineCurrentPageBoxes}
+                    title="Encaja automáticamente las cajas en los huecos blancos sin pisar las preguntas impresas"
+                    className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Sliders className="w-3.5 h-3.5 text-blue-700" />
+                    <span>Ajustar Huecos</span>
+                  </button>
+                )}
 
                 <button
                   type="button"
@@ -1082,13 +1342,13 @@ export default function App() {
                   }`}
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>{isAddingMode ? "Haz clic en la hoja..." : "Añadir Caja"}</span>
+                  <span>{isAddingMode ? "Clic en hoja..." : "Añadir Caja"}</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setShowBoundingGuides((v) => !v)}
-                  title="Mostrar u ocultar recuadros delimitadores para ver el resultado limpio"
+                  title="Mostrar u ocultar recuadros delimitadores"
                   className="p-1.5 text-slate-600 hover:text-slate-900 bg-white border border-slate-200 rounded-md transition-colors cursor-pointer"
                 >
                   {showBoundingGuides ? (
@@ -1127,6 +1387,50 @@ export default function App() {
               </div>
             </div>
 
+            {/* Page Switcher Bar when multiple pages or Notebook sheets exist */}
+            {pages.length > 1 && (
+              <div className="bg-slate-200/70 border-b border-slate-200 px-5 py-2 flex items-center justify-between gap-4">
+                <div className="flex items-center gap-1.5 overflow-x-auto">
+                  {pages.map((p) => {
+                    const isCurrent = p.pageNumber === currentPage;
+                    return (
+                      <button
+                        key={p.pageNumber}
+                        type="button"
+                        onClick={() => setCurrentPage(p.pageNumber)}
+                        className={`px-3 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap cursor-pointer flex items-center gap-1.5 ${
+                          isCurrent
+                            ? "bg-slate-900 text-white shadow-2xs"
+                            : "bg-white text-slate-700 hover:bg-slate-100 border border-slate-200"
+                        }`}
+                      >
+                        {p.isNotebookPage ? (
+                          <>
+                            <BookOpen className="w-3 h-3 text-blue-400" />
+                            <span>Cuaderno (Pág. {p.pageNumber})</span>
+                          </>
+                        ) : (
+                          <span>Hoja Original {p.pageNumber}</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {hasNotebookPages && (
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadPdf(true)}
+                    disabled={isExporting}
+                    className="px-3 py-1 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-md whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Download className="w-3 h-3" />
+                    <span>Descargar Solo Cuaderno (PDF)</span>
+                  </button>
+                )}
+              </div>
+            )}
+
             {/* Interactive PDF Viewport */}
             <div className="flex-1 overflow-auto p-6 flex flex-col items-center">
               {isLoadingPdf ? (
@@ -1138,25 +1442,31 @@ export default function App() {
                 </div>
               ) : activePageData ? (
                 <>
-                  {/* Contextual Callout if no answers solved yet */}
                   {annotations.length === 0 && activePageData.status === "idle" && (
-                    <div className="mb-4 max-w-2xl w-full bg-white border border-slate-200 rounded-lg px-4 py-3 flex items-center justify-between gap-4 shadow-2xs">
+                    <div className="mb-4 max-w-2xl w-full bg-white border border-slate-200 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 shadow-2xs">
                       <div className="text-xs text-slate-600">
                         <span className="font-semibold text-slate-900">
-                          Hoja lista en ritaGPT:
+                          Documento cargado:
                         </span>{" "}
-                        Pulsa{" "}
-                        <strong className="text-slate-900">Resolver con IA</strong>{" "}
-                        para detectar los espacios en blanco y escribir las
-                        respuestas a mano automáticamente.
+                        Elige si quieres rellenar los huecos encima o resolver
+                        las actividades en hojas de cuaderno aparte.
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => solveAllPagesInternal()}
-                        className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-md whitespace-nowrap shrink-0 cursor-pointer"
-                      >
-                        Resolver Ahora
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => solveSourcePages()}
+                          className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-md whitespace-nowrap cursor-pointer"
+                        >
+                          Resolver Automático
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => solveSourcePages(undefined, "notebook")}
+                          className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-md whitespace-nowrap cursor-pointer"
+                        >
+                          Resolver en Cuaderno Aparte
+                        </button>
+                      </div>
                     </div>
                   )}
 
@@ -1178,7 +1488,6 @@ export default function App() {
                     showBoundingGuides={showBoundingGuides}
                   />
 
-                  {/* Page Navigation Bar if multiple pages */}
                   {pages.length > 1 && (
                     <div className="mt-5 flex items-center gap-3 bg-white border border-slate-200 px-4 py-1.5 rounded-lg shadow-2xs">
                       <button
@@ -1205,45 +1514,11 @@ export default function App() {
                     </div>
                   )}
                 </>
-              ) : (
-                <div className="my-auto max-w-md w-full bg-white border border-slate-200 rounded-xl p-8 text-center">
-                  <Upload className="w-10 h-10 text-slate-400 mx-auto mb-3" />
-                  <h2 className="font-display text-base font-semibold text-slate-900">
-                    Sube tu PDF, Imagen o Haz una Foto
-                  </h2>
-                  <p className="text-xs text-slate-500 mt-1 mb-5">
-                    Detectamos los espacios en blanco con IA y escribimos las
-                    respuestas simulando tu letra a mano.
-                  </p>
-                  <div className="flex flex-wrap items-center justify-center gap-2.5">
-                    <button
-                      type="button"
-                      onClick={() => universalFileInputRef.current?.click()}
-                      className="px-4 py-2 bg-blue-700 text-white text-xs font-semibold rounded-lg hover:bg-blue-800 cursor-pointer"
-                    >
-                      Subir PDF o Foto
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setIsCameraModalOpen(true)}
-                      className="px-4 py-2 bg-slate-100 text-slate-700 text-xs font-medium rounded-lg hover:bg-slate-200 cursor-pointer"
-                    >
-                      Usar Cámara
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleLoadSamplePdf(false)}
-                      className="px-4 py-2 bg-slate-100 text-slate-700 text-xs font-medium rounded-lg hover:bg-slate-200 cursor-pointer"
-                    >
-                      Ficha Demo
-                    </button>
-                  </div>
-                </div>
-              )}
+              ) : null}
             </div>
           </main>
 
-          {/* RIGHT ZONE (30%): Control Deck (Handwriting Style, Custom Font Studio, Organic Mode & Exercise Inspector) */}
+          {/* RIGHT ZONE (30%): Control Deck */}
           <aside className="w-full lg:w-[410px] xl:w-[440px] bg-white border-t lg:border-t-0 lg:border-l border-slate-200 flex flex-col shrink-0 overflow-hidden">
             {/* Segmented Control Tabs */}
             <div className="p-3 border-b border-slate-200 bg-slate-50/60">
@@ -1258,7 +1533,7 @@ export default function App() {
                   }`}
                 >
                   <Sliders className="w-3.5 h-3.5" />
-                  <span>Letra y Modo Orgánico</span>
+                  <span>Cuaderno, Fuentes y Modo</span>
                 </button>
                 <button
                   type="button"
@@ -1279,19 +1554,84 @@ export default function App() {
             <div className="flex-1 overflow-y-auto p-5 space-y-6">
               {activeSidebarTab === "style" ? (
                 <>
-                  {/* Section 1: Handwriting Typography + Custom Font Creator Button */}
+                  {/* Section 0: Solve Mode (In-place vs Separate Notebook) */}
+                  <div>
+                    <h2 className="font-display text-sm font-semibold text-slate-900 mb-2">
+                      01. Modo de Resolución (Hoja vs Cuaderno Aparte)
+                    </h2>
+                    <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-100 rounded-lg mb-3">
+                      {[
+                        { id: "auto", label: "Automático" },
+                        { id: "notebook", label: "En Cuaderno" },
+                        { id: "in_place", label: "En la Hoja" },
+                      ].map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() =>
+                            setStyleSettings((prev) => ({
+                              ...prev,
+                              solveTargetMode: opt.id as SolveTargetMode,
+                            }))
+                          }
+                          className={`py-1.5 px-2 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                            styleSettings.solveTargetMode === opt.id
+                              ? "bg-white text-slate-900 shadow-2xs"
+                              : "text-slate-600 hover:text-slate-900"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Notebook Paper Style Selector */}
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-600">
+                        Papel del cuaderno aparte:
+                      </span>
+                      <div className="flex items-center gap-1">
+                        {[
+                          { id: "grid", label: "Cuadrícula" },
+                          { id: "lined", label: "Rayas" },
+                          { id: "blank", label: "Blanco" },
+                        ].map((pStyle) => (
+                          <button
+                            key={pStyle.id}
+                            type="button"
+                            onClick={() =>
+                              handleChangeNotebookPaperStyle(
+                                pStyle.id as NotebookPaperStyle
+                              )
+                            }
+                            className={`px-2 py-1 rounded text-[11px] font-medium border cursor-pointer ${
+                              styleSettings.notebookPaperStyle === pStyle.id
+                                ? "bg-blue-50 border-blue-600 text-blue-800"
+                                : "bg-white border-slate-200 text-slate-600"
+                            }`}
+                          >
+                            {pStyle.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <hr className="border-slate-200" />
+
+                  {/* Section 1: Handwriting Typography + Multi-Font Fusion Button */}
                   <div>
                     <div className="flex items-center justify-between mb-2.5">
                       <h2 className="font-display text-sm font-semibold text-slate-900">
-                        01. Tipografía Manuscrita
+                        02. Tipografía y Fusión Anti-Clon
                       </h2>
                       <button
                         type="button"
                         onClick={() => setIsFontStudioOpen(true)}
                         className="text-xs font-semibold text-blue-700 hover:underline flex items-center gap-1 cursor-pointer"
                       >
-                        <PenTool className="w-3 h-3" />
-                        <span>Crear / Subir mi Font</span>
+                        <Layers className="w-3.5 h-3.5" />
+                        <span>Subir / Fusionar Fonts</span>
                       </button>
                     </div>
 
@@ -1317,11 +1657,6 @@ export default function App() {
                             <div className="min-w-0">
                               <div className="text-xs font-semibold text-slate-900 truncate">
                                 {font.name}
-                                {font.isCustom && (
-                                  <span className="ml-1.5 text-[10px] font-normal text-blue-700">
-                                    · Personalizada
-                                  </span>
-                                )}
                               </div>
                               <div className="text-[11px] text-slate-500 truncate">
                                 {font.description}
@@ -1338,7 +1673,7 @@ export default function App() {
                               }}
                               className="text-lg whitespace-nowrap shrink-0"
                             >
-                              2x + 4 = 10
+                              La dama boba
                             </span>
                           </button>
                         );
@@ -1351,7 +1686,7 @@ export default function App() {
                   {/* Section 2: Ink Color */}
                   <div>
                     <h2 className="font-display text-sm font-semibold text-slate-900 mb-2.5">
-                      02. Tinta y Bolígrafo
+                      03. Tinta y Bolígrafo
                     </h2>
                     <div className="grid grid-cols-2 gap-2">
                       {INK_COLORS.map((ink) => {
@@ -1385,15 +1720,15 @@ export default function App() {
 
                   <hr className="border-slate-200" />
 
-                  {/* Section 3: Organic Mode (Human Imperfections) */}
+                  {/* Section 3: Organic Mode (Human Imperfections & Anti-Clone) */}
                   <div>
                     <div className="flex items-center justify-between mb-2">
                       <div>
                         <h2 className="font-display text-sm font-semibold text-slate-900">
-                          03. Modo Orgánico Humano
+                          04. Modo Orgánico Humano
                         </h2>
                         <p className="text-xs text-slate-500">
-                          Simula imperfecciones naturales de estudiante
+                          Variación de letras repetidas, tachones y deslices
                         </p>
                       </div>
                       <button
@@ -1417,7 +1752,27 @@ export default function App() {
 
                     {styleSettings.organic.enabled && (
                       <div className="mt-4 space-y-4 bg-slate-50 p-3.5 rounded-lg border border-slate-200">
-                        {/* Slider 1: Subtle Calculation / Answer Mistakes */}
+                        {/* Anti-Clone Toggle */}
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-medium text-slate-800">
+                            Variar letras repetidas (ej. cada "a" distinta):
+                          </span>
+                          <input
+                            type="checkbox"
+                            checked={
+                              styleSettings.organic.antiCloneLetterVariation
+                            }
+                            onChange={(e) =>
+                              handleUpdateOrganicSettings(
+                                { antiCloneLetterVariation: e.target.checked },
+                                false
+                              )
+                            }
+                            className="w-4 h-4 accent-blue-700 cursor-pointer"
+                          />
+                        </div>
+
+                        {/* Slider 1: Mistakes */}
                         <div>
                           <div className="flex items-center justify-between text-xs mb-1">
                             <label
@@ -1444,13 +1799,9 @@ export default function App() {
                             }
                             className="w-full accent-blue-700 cursor-pointer"
                           />
-                          <p className="text-[11px] text-slate-500 mt-0.5">
-                            Introduce algún desliz de cálculo o respuesta (10–15%
-                            recomendado) para mayor realismo.
-                          </p>
                         </div>
 
-                        {/* Slider 2: Simulated Cross-outs (Tachones) */}
+                        {/* Slider 2: Cross-outs */}
                         <div>
                           <div className="flex items-center justify-between text-xs mb-1">
                             <label
@@ -1477,10 +1828,6 @@ export default function App() {
                             }
                             className="w-full accent-blue-700 cursor-pointer"
                           />
-                          <p className="text-[11px] text-slate-500 mt-0.5">
-                            Escribe un inicio dubitativo tachado a bolígrafo antes
-                            de la solución.
-                          </p>
                         </div>
 
                         {/* Slider 3: Stroke Slant & Pressure Variation */}
@@ -1522,35 +1869,13 @@ export default function App() {
                             className="w-full py-1.5 px-3 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 rounded-md text-xs font-medium flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
                           >
                             <Shuffle className="w-3.5 h-3.5" />
-                            <span>Re-sortear qué ejercicios tienen fallo o tachón</span>
+                            <span>
+                              Re-sortear qué ejercicios tienen fallo o tachón
+                            </span>
                           </button>
                         )}
                       </div>
                     )}
-                  </div>
-
-                  <hr className="border-slate-200" />
-
-                  {/* Section 4: Optional AI Instructions */}
-                  <div>
-                    <label
-                      htmlFor="custom-ai-prompt"
-                      className="block font-display text-sm font-semibold text-slate-900 mb-1"
-                    >
-                      04. Instrucciones para ritaGPT (Opcional)
-                    </label>
-                    <p className="text-xs text-slate-500 mb-2">
-                      Indica el nivel académico o cómo prefieres que desarrolle las
-                      respuestas antes de resolver.
-                    </p>
-                    <textarea
-                      id="custom-ai-prompt"
-                      rows={2}
-                      value={customInstructions}
-                      onChange={(e) => setCustomInstructions(e.target.value)}
-                      placeholder="Ej: Usa respuestas cortas y directas, nivel 4º ESO..."
-                      className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-800 focus:outline-none focus:border-blue-600"
-                    />
                   </div>
                 </>
               ) : (
@@ -1558,35 +1883,36 @@ export default function App() {
                 <div className="space-y-4">
                   <div className="flex items-center justify-between">
                     <div className="text-xs text-slate-600">
-                      Haz clic en cualquier respuesta sobre el PDF para moverla,
-                      ajustar su hueco o editar su contenido.
+                      Haz clic en cualquier respuesta para ir a su hoja, moverla
+                      o editarla.
                     </div>
-                    {pages.length > 1 && (
-                      <button
-                        type="button"
-                        onClick={handleSolveCurrentPage}
-                        disabled={isSolvingAll}
-                        className="text-xs font-medium text-blue-700 hover:underline whitespace-nowrap shrink-0"
-                      >
-                        Resolver pág. {currentPage}
-                      </button>
-                    )}
                   </div>
 
                   {annotations.length === 0 ? (
-                    <div className="border border-slate-200 rounded-lg p-6 text-center bg-slate-50/50">
-                      <p className="text-xs text-slate-600 mb-3">
+                    <div className="border border-slate-200 rounded-lg p-6 text-center bg-slate-50/50 space-y-3">
+                      <p className="text-xs text-slate-600">
                         Aún no se han generado respuestas para este documento.
                       </p>
-                      <button
-                        type="button"
-                        onClick={() => solveAllPagesInternal()}
-                        disabled={isSolvingAll || pages.length === 0}
-                        className="px-3.5 py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <Wand2 className="w-3.5 h-3.5" />
-                        <span>Resolver Ejercicios con ritaGPT</span>
-                      </button>
+                      <div className="flex flex-col gap-2">
+                        <button
+                          type="button"
+                          onClick={() => solveSourcePages()}
+                          disabled={isSolvingAll || pages.length === 0}
+                          className="w-full py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-md transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <Wand2 className="w-3.5 h-3.5" />
+                          <span>Resolver Automático con ritaGPT</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => solveSourcePages(undefined, "notebook")}
+                          disabled={isSolvingAll || pages.length === 0}
+                          className="w-full py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-md transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <BookOpen className="w-3.5 h-3.5" />
+                          <span>Resolver en Hojas de Cuaderno Aparte</span>
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <div className="space-y-3">
@@ -1620,7 +1946,6 @@ export default function App() {
                                 : "border-slate-200 bg-white hover:border-slate-300"
                             }`}
                           >
-                            {/* Top Metadata Row (Zero-Pill clean text with · separators) */}
                             <div className="flex items-center justify-between gap-2 mb-1.5">
                               <div className="flex items-center gap-1.5 text-xs">
                                 <span className="font-semibold text-slate-900">
@@ -1633,7 +1958,9 @@ export default function App() {
                                   ·
                                 </span>
                                 <span className="font-mono-tabular text-slate-500">
-                                  Pág. {ann.pageNumber}
+                                  {ann.isNotebookEntry
+                                    ? `Cuaderno (Pág. ${ann.pageNumber})`
+                                    : `Pág. ${ann.pageNumber}`}
                                 </span>
                                 <span
                                   aria-hidden="true"
@@ -1642,8 +1969,7 @@ export default function App() {
                                   ·
                                 </span>
                                 <span className="font-mono-tabular text-slate-500">
-                                  {computedSize}pt{" "}
-                                  {ann.autoFitFont ? "(Auto)" : "(Manual)"}
+                                  {computedSize}pt
                                 </span>
                               </div>
 
@@ -1660,12 +1986,10 @@ export default function App() {
                               </button>
                             </div>
 
-                            {/* Question summary */}
                             <p className="text-xs text-slate-500 line-clamp-1 mb-2.5">
                               {ann.questionSummary}
                             </p>
 
-                            {/* Editable Answer Textarea */}
                             <div className="mb-2.5">
                               <textarea
                                 rows={2}
@@ -1680,13 +2004,11 @@ export default function App() {
                               />
                             </div>
 
-                            {/* Organic Mode Controls per Exercise */}
                             <div
                               onClick={(e) => e.stopPropagation()}
                               className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100"
                             >
                               <div className="flex items-center gap-1.5">
-                                {/* Toggle Correct vs Mistake */}
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -1709,12 +2031,11 @@ export default function App() {
                                   ) : (
                                     <>
                                       <Check className="w-3 h-3 text-emerald-600" />
-                                      <span>● Respuesta Exacta</span>
+                                      <span>● Exacta</span>
                                     </>
                                   )}
                                 </button>
 
-                                {/* Toggle Cross-out */}
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -1733,7 +2054,6 @@ export default function App() {
                                 </button>
                               </div>
 
-                              {/* Font Size Auto/Manual Switch */}
                               <div className="flex items-center gap-1 text-[11px]">
                                 <button
                                   type="button"
@@ -1745,9 +2065,7 @@ export default function App() {
                                   }
                                   className="text-slate-500 hover:text-slate-900 underline mr-1"
                                 >
-                                  {ann.autoFitFont
-                                    ? "Fijar tamaño"
-                                    : "Auto-ajustar"}
+                                  {ann.autoFitFont ? "Fijar tamaño" : "Auto"}
                                 </button>
                                 {!ann.autoFitFont && (
                                   <input
@@ -1767,7 +2085,6 @@ export default function App() {
                               </div>
                             </div>
 
-                            {/* Extra details when selected: Mistake explanation & Crossed-out word input */}
                             {isSelected && (
                               <div
                                 onClick={(e) => e.stopPropagation()}
@@ -1809,9 +2126,7 @@ export default function App() {
                                     className="inline-flex items-center gap-1 text-slate-500 hover:text-slate-800"
                                   >
                                     <RotateCcw className="w-3 h-3" />
-                                    <span>
-                                      Restaurar respuesta original de ritaGPT
-                                    </span>
+                                    <span>Restaurar original</span>
                                   </button>
                                 )}
                               </div>
@@ -1826,24 +2141,48 @@ export default function App() {
             </div>
 
             {/* Sticky Sidebar Action Footer */}
-            <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-3">
-              <div className="text-xs text-slate-600">
-                <div className="font-semibold text-slate-900">
-                  Exportación directa en PDF
-                </div>
-                <div className="text-[11px] text-slate-500">
-                  Estampa tu letra y tachones en alta resolución
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={handleDownloadPdf}
-                disabled={!pdfBytes || isExporting || pages.length === 0}
-                className="px-4 py-2.5 bg-blue-700 hover:bg-blue-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Download className="w-4 h-4" />
-                <span>{isExporting ? "Exportando..." : "Descargar PDF"}</span>
-              </button>
+            <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-2">
+              {hasNotebookPages ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadPdf(true)}
+                    disabled={isExporting}
+                    className="flex-1 py-2.5 px-3 bg-blue-700 hover:bg-blue-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Descargar Cuaderno</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadPdf(false)}
+                    disabled={isExporting}
+                    className="py-2.5 px-3 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <span>Hoja + Cuaderno</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="text-xs text-slate-600">
+                    <div className="font-semibold text-slate-900">
+                      Exportación en PDF
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      Fusión de letra y tachones
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadPdf(false)}
+                    disabled={!pdfBytes || isExporting || pages.length === 0}
+                    className="px-4 py-2.5 bg-blue-700 hover:bg-blue-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>{isExporting ? "Exportando..." : "Descargar PDF"}</span>
+                  </button>
+                </>
+              )}
             </div>
           </aside>
         </div>

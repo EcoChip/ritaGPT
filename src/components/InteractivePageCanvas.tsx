@@ -10,6 +10,7 @@ import {
 import {
   computeAutoFontSize,
   getAnnotationActiveText,
+  pickCharacterCssFamily,
   resolveFontOption,
   seededRandom,
 } from "../utils/handwritingRenderer";
@@ -63,6 +64,10 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
   const variationIntensity = styleSettings.organic.enabled
     ? styleSettings.organic.strokeVariationPercent / 100
     : 0;
+  const antiCloneEnabled =
+    styleSettings.organic.antiCloneLetterVariation ||
+    fontMeta.customType === "fused_fonts" ||
+    Boolean(fontMeta.fusedCssFamilies && fontMeta.fusedCssFamilies.length > 1);
   const customSlantDeg = fontMeta.customSlantDeg || 0;
 
   const handleContainerPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -152,34 +157,84 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
     }
   };
 
-  const renderTokenWithOptionalGlyphs = (token: string, sizePx: number) => {
-    if (fontMeta.customType === "drawn_glyphs" && fontMeta.glyphMap) {
-      return token.split("").map((ch, cIdx) => {
-        const glyphUrl =
-          fontMeta.glyphMap?.[ch] ||
-          fontMeta.glyphMap?.[ch.toLowerCase()] ||
-          fontMeta.glyphMap?.[ch.toUpperCase()];
-        if (glyphUrl) {
-          return (
-            <img
-              key={cIdx}
-              src={glyphUrl}
-              alt={ch}
-              referrerPolicy="no-referrer"
-              style={{
-                height: `${sizePx * 1.05}px`,
-                width: "auto",
-                display: "inline-block",
-                verticalAlign: "middle",
-                marginRight: `${fontMeta.customLetterSpacing || 0}px`,
-              }}
-            />
-          );
-        }
-        return <span key={cIdx}>{ch}</span>;
-      });
-    }
-    return token;
+  /**
+   * Renders a word character-by-character so that repeated letters (e.g. multiple 'a's)
+   * alternate across fused fonts / drawn glyph variants and have subtle anti-clone variation.
+   */
+  const renderTokenWithFusedCharacters = (
+    token: string,
+    sizePx: number,
+    seed: number,
+    charCounts: Record<string, number>
+  ) => {
+    return token.split("").map((ch, cIdx) => {
+      const lowerKey = ch.toLowerCase();
+      const occ = (charCounts[lowerKey] = (charCounts[lowerKey] || 0) + 1);
+
+      // 1. Check if custom drawn glyph variants exist for this character
+      const variantsList =
+        fontMeta.glyphVariantsMap?.[ch] ||
+        fontMeta.glyphVariantsMap?.[lowerKey] ||
+        fontMeta.glyphVariantsMap?.[ch.toUpperCase()] ||
+        (fontMeta.glyphMap?.[ch] ? [fontMeta.glyphMap[ch]] : undefined) ||
+        (fontMeta.glyphMap?.[lowerKey] ? [fontMeta.glyphMap[lowerKey]] : undefined);
+
+      const scaleY = antiCloneEnabled
+        ? 1 + (seededRandom(seed + occ * 19, cIdx + 1) - 0.5) * 0.13 * Math.max(0.4, variationIntensity)
+        : 1;
+      const scaleX = antiCloneEnabled
+        ? 1 + (seededRandom(seed + occ * 23, cIdx + 2) - 0.5) * 0.1 * Math.max(0.4, variationIntensity)
+        : 1;
+      const yOff = antiCloneEnabled
+        ? (seededRandom(seed + occ * 31, cIdx + 3) - 0.5) * 1.4
+        : 0;
+      const rotDeg = antiCloneEnabled
+        ? (seededRandom(seed + occ * 37, cIdx + 4) - 0.5) * 3.2
+        : 0;
+
+      if (variantsList && variantsList.length > 0) {
+        const chosenUrl = variantsList[Math.abs(seed + occ) % variantsList.length];
+        return (
+          <img
+            key={cIdx}
+            src={chosenUrl}
+            alt={ch}
+            referrerPolicy="no-referrer"
+            style={{
+              height: `${sizePx * 1.05}px`,
+              width: "auto",
+              display: "inline-block",
+              verticalAlign: "middle",
+              marginRight: `${fontMeta.customLetterSpacing || 0}px`,
+              transform: `translateY(${yOff.toFixed(1)}px) rotate(${rotDeg.toFixed(1)}deg) scale(${scaleX.toFixed(2)}, ${scaleY.toFixed(2)})`,
+            }}
+          />
+        );
+      }
+
+      const charFontFamily = pickCharacterCssFamily(
+        fontMeta,
+        ch,
+        occ,
+        seed,
+        antiCloneEnabled
+      );
+
+      return (
+        <span
+          key={cIdx}
+          style={{
+            fontFamily: charFontFamily,
+            display: "inline-block",
+            transform: antiCloneEnabled
+              ? `translateY(${yOff.toFixed(1)}px) rotate(${rotDeg.toFixed(1)}deg) scale(${scaleX.toFixed(2)}, ${scaleY.toFixed(2)})`
+              : undefined,
+          }}
+        >
+          {ch}
+        </span>
+      );
+    });
   };
 
   return (
@@ -196,7 +251,7 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
         isAddingMode ? "cursor-crosshair ring-2 ring-blue-600/40" : ""
       }`}
     >
-      {/* Original PDF Page Image */}
+      {/* Original PDF or Generated Notebook Page Image */}
       <img
         src={page.imageDataUrl}
         alt={`Página ${page.pageNumber}`}
@@ -214,7 +269,7 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
             ritaGPT analizando y resolviendo la página {page.pageNumber}...
           </p>
           <p className="text-xs text-slate-500 mt-1">
-            Detectando zonas en blanco y ajustando caligrafía orgánica
+            Detectando actividades y preparando escritura manuscrita
           </p>
         </div>
       )}
@@ -232,9 +287,10 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
         const scaledFontSizePx = baseFontSizePt * zoom;
         const activeText = getAnnotationActiveText(ann);
         const words = activeText.split(/(\s+)/);
+        const charCounts: Record<string, number> = {};
 
         const boxTiltDeg =
-          (seededRandom(ann.seed, 0) - 0.5) * 2.2 * variationIntensity;
+          (seededRandom(ann.seed, 0) - 0.5) * 1.8 * variationIntensity;
 
         return (
           <div
@@ -246,7 +302,7 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
               height: `${ann.box.height}%`,
             }}
             onPointerDown={(e) => startDrag(e, ann, "move")}
-            className={`group absolute flex items-center transition-colors ${
+            className={`group absolute flex items-start transition-colors ${
               isSelected
                 ? "ring-2 ring-blue-600 bg-blue-50/20 z-20 cursor-move"
                 : showBoundingGuides
@@ -271,11 +327,6 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
                       customText: null,
                     })
                   }
-                  title={
-                    ann.useMistake
-                      ? "Mostrando fallo humano deliberado (clic para respuesta perfecta)"
-                      : "Mostrando respuesta correcta (clic para simular fallo humano)"
-                  }
                   className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors ${
                     ann.useMistake
                       ? "bg-amber-600 text-white"
@@ -299,7 +350,6 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
                   onClick={() =>
                     onUpdateAnnotation(ann.id, { useCrossOut: !ann.useCrossOut })
                   }
-                  title="Alternar tachón simulado al inicio"
                   className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors ${
                     ann.useCrossOut
                       ? "bg-blue-600 text-white"
@@ -352,9 +402,11 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
               {ann.useCrossOut && ann.crossedOutWord && (
                 <span className="relative inline-block mr-2.5 align-baseline">
                   <span style={{ opacity: inkMeta.opacityBase * 0.88 }}>
-                    {renderTokenWithOptionalGlyphs(
+                    {renderTokenWithFusedCharacters(
                       ann.crossedOutWord,
-                      scaledFontSizePx
+                      scaledFontSizePx,
+                      ann.seed,
+                      charCounts
                     )}
                   </span>
                   <svg
@@ -382,19 +434,19 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
                 </span>
               )}
 
-              {/* Words with subtle organic jitter and ink pressure variation */}
+              {/* Words with subtle organic jitter and per-character font fusion */}
               {words.map((token, idx) => {
                 if (/^\s+$/.test(token)) {
                   return <span key={idx}>{token}</span>;
                 }
                 const yShiftPx =
                   (seededRandom(ann.seed, idx * 5 + 1) - 0.5) *
-                  2.6 *
+                  2.4 *
                   zoom *
                   variationIntensity;
                 const rotDeg =
                   (seededRandom(ann.seed, idx * 5 + 2) - 0.5) *
-                  2.8 *
+                  2.4 *
                   variationIntensity;
                 const wordOpacity = Math.max(
                   0.7,
@@ -415,7 +467,12 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
                       opacity: wordOpacity,
                     }}
                   >
-                    {renderTokenWithOptionalGlyphs(token, scaledFontSizePx)}
+                    {renderTokenWithFusedCharacters(
+                      token,
+                      scaledFontSizePx,
+                      ann.seed + idx * 7,
+                      charCounts
+                    )}
                   </span>
                 );
               })}

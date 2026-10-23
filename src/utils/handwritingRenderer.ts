@@ -7,7 +7,11 @@ import {
   PdfPageData,
   StyleSettings,
 } from "../types";
-import { getCachedGlyphImage } from "./customFontManager";
+import {
+  dataUrlToUint8Array,
+  getCachedGlyphVariantImage,
+} from "./customFontManager";
+import { embedImageBytesSafe } from "./pdfLoader";
 
 /**
  * Deterministic pseudo-random number generator in [0, 1] from an integer seed
@@ -39,6 +43,35 @@ export function resolveFontOption(
     HANDWRITING_FONTS.find((f) => f.id === fontId) ||
     HANDWRITING_FONTS[0]
   );
+}
+
+/**
+ * Picks which font family from a fused font pool to use for a specific character occurrence,
+ * ensuring consecutive 'a's or 'e's never use the exact same glyph shape.
+ */
+export function pickCharacterCssFamily(
+  fontMeta: HandwritingFontOption,
+  char: string,
+  occurrenceIndex: number,
+  seed: number,
+  antiCloneEnabled: boolean
+): string {
+  const pool =
+    fontMeta.fusedCssFamilies && fontMeta.fusedCssFamilies.length > 1
+      ? fontMeta.fusedCssFamilies
+      : antiCloneEnabled && !fontMeta.isCustom
+      ? [
+          fontMeta.cssFamily,
+          "'Caveat', cursive",
+          "'Kalam', cursive",
+          "'Patrick Hand', cursive",
+        ]
+      : [fontMeta.cssFamily];
+
+  if (pool.length <= 1) return fontMeta.cssFamily;
+  const charCode = char.charCodeAt(0) || 1;
+  const idx = Math.abs(seed + charCode * 3 + occurrenceIndex * 7) % pool.length;
+  return pool[idx];
 }
 
 /**
@@ -97,22 +130,50 @@ export function computeAutoFontSize(
 
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
-  if (!ctx) return 18;
+  if (!ctx) return 15;
 
-  const usableWidth = Math.max(36, boxWidthPx - 12);
-  const usableHeight = Math.max(18, boxHeightPx - 6);
+  const isSmallCallout =
+    !ann.isNotebookEntry &&
+    (ann.subjectType === "short_blank" ||
+      boxWidthPx < 145 ||
+      boxHeightPx < 34);
 
-  const minSize = 11;
-  const maxSize = Math.min(34, Math.floor(usableHeight * 0.78));
+  const horizontalPad = isSmallCallout ? 7 : 12;
+  const verticalPad = isSmallCallout ? 3 : 6;
 
-  for (let size = Math.max(minSize, maxSize); size >= minSize; size -= 1) {
+  const usableWidth = Math.max(24, boxWidthPx - horizontalPad);
+  const usableHeight = Math.max(12, boxHeightPx - verticalPad);
+
+  const minSize = ann.isNotebookEntry ? 12.5 : isSmallCallout ? 8.0 : 9.5;
+  const maxSize = Math.min(
+    ann.isNotebookEntry ? 21 : isSmallCallout ? 20 : 28,
+    Math.floor(usableHeight * (isSmallCallout ? 0.82 : 0.76))
+  );
+
+  // Account for slight character spacing & scaleX variation (~6% buffer)
+  const effectiveMaxWidth = usableWidth * 0.93;
+
+  for (let size = Math.max(minSize, maxSize); size >= minSize; size -= 0.5) {
     ctx.font = `${fontMeta.baseWeight} ${size}px ${fontMeta.cssFamily}`;
-    const lines = wrapTextLines(ctx, fullSampleText, usableWidth);
-    const totalHeight = lines.length * size * fontMeta.lineHeightMultiplier;
-    const widestLine = Math.max(...lines.map((l) => ctx.measureText(l).width), 0);
+    const lines = wrapTextLines(ctx, fullSampleText, effectiveMaxWidth);
+    const lineHeight =
+      size * (isSmallCallout ? Math.min(1.12, fontMeta.lineHeightMultiplier) : fontMeta.lineHeightMultiplier);
+    const totalHeight = lines.length * lineHeight;
+    const widestLine = Math.max(
+      ...lines.map((l) => ctx.measureText(l).width),
+      0
+    );
 
-    if (totalHeight <= usableHeight && widestLine <= usableWidth * 1.05) {
-      return size;
+    // For very short callout boxes (height < 26pt), strongly prefer fitting on 1 single line if possible
+    const fitsSingleLineWhenTiny =
+      !isSmallCallout || boxHeightPx >= 27 || lines.length === 1 || size <= 9.5;
+
+    if (
+      totalHeight <= usableHeight &&
+      widestLine <= usableWidth &&
+      fitsSingleLineWhenTiny
+    ) {
+      return Number(size.toFixed(1));
     }
   }
 
@@ -120,66 +181,102 @@ export function computeAutoFontSize(
 }
 
 /**
- * Helper to draw a word on canvas, supporting both standard/uploaded FontFace
- * and character-by-character custom drawn glyphs tinted with the selected ink color.
+ * Draws a single word onto a 2D canvas, alternating across fused fonts and/or multiple drawn glyph variants
+ * character-by-character so two 'a's never look identical.
  */
-function drawWordWithFontOrGlyphs(
+function drawWordWithFusedFontsOrGlyphs(
   ctx: CanvasRenderingContext2D,
   word: string,
   fontMeta: HandwritingFontOption,
   fontSizePx: number,
   rgbColor: [number, number, number],
-  alpha: number
+  alpha: number,
+  seed: number,
+  charOccurrenceCounter: Record<string, number>,
+  antiCloneEnabled: boolean,
+  variationIntensity: number
 ) {
   const [r, g, b] = rgbColor;
   ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(3)})`;
 
-  if (fontMeta.customType === "drawn_glyphs" && fontMeta.glyphMap) {
-    let charX = 0;
-    const extraSpacing = (fontMeta.customLetterSpacing || 0) * (fontSizePx / 20);
-    for (const ch of word) {
-      const glyphImg =
-        getCachedGlyphImage(fontMeta.id, ch) ||
-        getCachedGlyphImage(fontMeta.id, ch.toLowerCase()) ||
-        getCachedGlyphImage(fontMeta.id, ch.toUpperCase());
+  let charX = 0;
+  const extraSpacing = (fontMeta.customLetterSpacing || 0) * (fontSizePx / 20);
 
-      if (glyphImg) {
-        const glyphW = fontSizePx * 0.68;
-        const glyphH = fontSizePx * 1.05;
+  for (let i = 0; i < word.length; i++) {
+    const ch = word[i];
+    const lowerKey = ch.toLowerCase();
+    const occ = (charOccurrenceCounter[lowerKey] =
+      (charOccurrenceCounter[lowerKey] || 0) + 1);
 
-        // Tint the drawn glyph to match the ink color
-        const off = document.createElement("canvas");
-        off.width = Math.max(1, Math.round(glyphW * 2));
-        off.height = Math.max(1, Math.round(glyphH * 2));
-        const offCtx = off.getContext("2d");
-        if (offCtx) {
-          offCtx.drawImage(glyphImg, 0, 0, off.width, off.height);
-          offCtx.globalCompositeOperation = "source-in";
-          offCtx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(3)})`;
-          offCtx.fillRect(0, 0, off.width, off.height);
-          ctx.drawImage(off, charX, 0, glyphW, glyphH);
-        }
-        charX += glyphW * 0.82 + extraSpacing;
-      } else {
-        ctx.fillText(ch, charX, 0);
-        charX += ctx.measureText(ch).width + extraSpacing;
+    const glyphImg = getCachedGlyphVariantImage(fontMeta.id, ch, occ + seed);
+
+    // Subtle per-character anti-clone variation (scale, y-offset, micro-tilt)
+    const charScaleY = antiCloneEnabled
+      ? 1 + (seededRandom(seed + occ * 19, i + 1) - 0.5) * 0.13 * Math.max(0.4, variationIntensity)
+      : 1;
+    const charScaleX = antiCloneEnabled
+      ? 1 + (seededRandom(seed + occ * 23, i + 2) - 0.5) * 0.1 * Math.max(0.4, variationIntensity)
+      : 1;
+    const charYOffset = antiCloneEnabled
+      ? (seededRandom(seed + occ * 31, i + 3) - 0.5) * (fontSizePx * 0.08)
+      : 0;
+    const charRot = antiCloneEnabled
+      ? (seededRandom(seed + occ * 37, i + 4) - 0.5) * 0.06
+      : 0;
+
+    if (glyphImg) {
+      const glyphW = fontSizePx * 0.68;
+      const glyphH = fontSizePx * 1.05;
+
+      const off = document.createElement("canvas");
+      off.width = Math.max(1, Math.round(glyphW * 2));
+      off.height = Math.max(1, Math.round(glyphH * 2));
+      const offCtx = off.getContext("2d");
+      if (offCtx) {
+        offCtx.drawImage(glyphImg, 0, 0, off.width, off.height);
+        offCtx.globalCompositeOperation = "source-in";
+        offCtx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(3)})`;
+        offCtx.fillRect(0, 0, off.width, off.height);
+
+        ctx.save();
+        ctx.translate(charX, charYOffset);
+        ctx.rotate(charRot);
+        ctx.scale(charScaleX, charScaleY);
+        ctx.drawImage(off, 0, 0, glyphW, glyphH);
+        ctx.restore();
       }
+      charX += glyphW * 0.82 * charScaleX + extraSpacing;
+    } else {
+      const charFontFamily = pickCharacterCssFamily(
+        fontMeta,
+        ch,
+        occ,
+        seed,
+        antiCloneEnabled
+      );
+      ctx.save();
+      ctx.font = `${fontMeta.baseWeight} ${fontSizePx}px ${charFontFamily}`;
+      ctx.translate(charX, charYOffset);
+      ctx.rotate(charRot);
+      ctx.scale(charScaleX, charScaleY);
+      ctx.fillText(ch, 0, 0);
+      const chWidth = ctx.measureText(ch).width;
+      ctx.restore();
+
+      charX += chWidth * charScaleX + extraSpacing;
     }
-  } else {
-    ctx.fillText(word, 0, 0);
   }
 }
 
 /**
  * Renders all annotations for a single page onto a transparent high-DPI canvas.
- * Used both for pixel-accurate PDF export and high-res rendering.
  */
 export function renderAnnotationsToCanvas(
   pageWidthPt: number,
   pageHeightPt: number,
   annotations: AnswerAnnotation[],
   style: StyleSettings,
-  scaleFactor: number = 2.5,
+  scaleFactor: number = 2.4,
   allFonts: HandwritingFontOption[] = HANDWRITING_FONTS
 ): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
@@ -196,6 +293,10 @@ export function renderAnnotationsToCanvas(
   const variationIntensity = style.organic.enabled
     ? style.organic.strokeVariationPercent / 100
     : 0;
+  const antiCloneEnabled =
+    style.organic.antiCloneLetterVariation ||
+    fontMeta.customType === "fused_fonts" ||
+    Boolean(fontMeta.fusedCssFamilies && fontMeta.fusedCssFamilies.length > 1);
   const customSlantRad = ((fontMeta.customSlantDeg || 0) * Math.PI) / 180;
 
   for (const ann of annotations) {
@@ -204,26 +305,50 @@ export function renderAnnotationsToCanvas(
     const boxW = (ann.box.width / 100) * canvas.width;
     const boxH = (ann.box.height / 100) * canvas.height;
 
+    const boxWidthPt = (ann.box.width / 100) * pageWidthPt;
+    const boxHeightPt = (ann.box.height / 100) * pageHeightPt;
+
+    const isSmallCallout =
+      !ann.isNotebookEntry &&
+      (ann.subjectType === "short_blank" ||
+        boxWidthPt < 145 ||
+        boxHeightPt < 34);
+
     const baseFontSize = computeAutoFontSize(
       ann,
-      (ann.box.width / 100) * pageWidthPt,
-      (ann.box.height / 100) * pageHeightPt,
+      boxWidthPt,
+      boxHeightPt,
       style,
       allFonts
     );
     const fontSizePx = baseFontSize * scaleFactor;
-    const lineHeightPx = fontSizePx * fontMeta.lineHeightMultiplier;
+    const effectiveLineMultiplier = isSmallCallout
+      ? Math.min(1.12, fontMeta.lineHeightMultiplier)
+      : fontMeta.lineHeightMultiplier;
+    const lineHeightPx = fontSizePx * effectiveLineMultiplier;
 
     ctx.save();
+
+    // Clip to a generous safety boundary around the box on worksheet pages so text never spills into adjacent boxes
+    if (!ann.isNotebookEntry) {
+      ctx.beginPath();
+      ctx.rect(
+        boxX - 3 * scaleFactor,
+        boxY - 3 * scaleFactor,
+        boxW + 6 * scaleFactor,
+        boxH + 6 * scaleFactor
+      );
+      ctx.clip();
+    }
+
     ctx.font = `${fontMeta.baseWeight} ${fontSizePx}px ${fontMeta.cssFamily}`;
     ctx.textBaseline = "top";
 
     const [r, g, b] = inkMeta.rgb;
     const activeText = getAnnotationActiveText(ann);
+    const charOccurrenceCounter: Record<string, number> = {};
 
-    let cursorX = boxX + 4 * scaleFactor;
-    let cursorY = boxY + 2 * scaleFactor;
-
+    const padLeftPx = (isSmallCallout ? 3 : 4.5) * scaleFactor;
     const fullTextForWrap =
       ann.useCrossOut && ann.crossedOutWord
         ? `${ann.crossedOutWord}   ${activeText}`
@@ -231,14 +356,31 @@ export function renderAnnotationsToCanvas(
     const wrappedPreview = wrapTextLines(
       ctx,
       fullTextForWrap,
-      Math.max(40, boxW - 8 * scaleFactor)
+      Math.max(24, boxW - padLeftPx * 2)
     );
     const totalTextHeight = wrappedPreview.length * lineHeightPx;
-    if (totalTextHeight < boxH * 0.72) {
-      cursorY = boxY + Math.max(2 * scaleFactor, (boxH - totalTextHeight) * 0.42);
+
+    let startX = boxX + padLeftPx;
+    let cursorY = boxY + 2 * scaleFactor;
+
+    if (!ann.isNotebookEntry) {
+      if (totalTextHeight < boxH * 0.82) {
+        cursorY =
+          boxY + Math.max(1.5 * scaleFactor, (boxH - totalTextHeight) * 0.42);
+      }
+      // For small 1-line diagram callout boxes, gently center horizontally inside the box
+      if (isSmallCallout && wrappedPreview.length === 1 && !ann.useCrossOut) {
+        const singleLineWidth = ctx.measureText(wrappedPreview[0]).width * 1.04;
+        if (singleLineWidth < boxW - padLeftPx * 2) {
+          const centeredOffset = (boxW - singleLineWidth) * 0.38;
+          startX = boxX + Math.max(padLeftPx, centeredOffset);
+        }
+      }
     }
 
-    // 1. If useCrossOut is active, draw the crossed-out word first with realistic pen scratch strokes
+    let cursorX = startX;
+
+    // 1. Crossed-out prefix word if enabled
     if (ann.useCrossOut && ann.crossedOutWord.trim().length > 0) {
       const crossWord = ann.crossedOutWord.trim();
       const crossWidth = ctx.measureText(crossWord).width;
@@ -252,16 +394,19 @@ export function renderAnnotationsToCanvas(
       ctx.save();
       ctx.translate(cursorX, cursorY);
       ctx.rotate(wordTilt);
-      drawWordWithFontOrGlyphs(
+      drawWordWithFusedFontsOrGlyphs(
         ctx,
         crossWord,
         fontMeta,
         fontSizePx,
         inkMeta.rgb,
-        wordAlpha
+        wordAlpha,
+        ann.seed,
+        charOccurrenceCounter,
+        antiCloneEnabled,
+        variationIntensity
       );
 
-      // Draw 2 organic ballpoint pen scratch lines over the crossed-out word
       ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${Math.min(0.98, wordAlpha + 0.06).toFixed(3)})`;
       ctx.lineWidth = Math.max(1.3, baseFontSize * 0.085) * scaleFactor;
       ctx.lineCap = "round";
@@ -290,27 +435,30 @@ export function renderAnnotationsToCanvas(
 
       ctx.restore();
 
-      cursorX += crossWidth + 10 * scaleFactor;
+      cursorX += crossWidth + 8 * scaleFactor;
     }
 
-    // 2. Draw the main answer word-by-word with organic baseline jitter, slant, and ink pressure
+    // 2. Main answer word-by-word
     const paragraphs = activeText.split(/\n/);
     let wordStep = 10;
-    const rightLimit = boxX + boxW - 4 * scaleFactor;
+    const rightLimit = boxX + boxW - padLeftPx * 0.8;
 
     for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
       const words = paragraphs[pIdx].split(/\s+/).filter(Boolean);
       for (let wIdx = 0; wIdx < words.length; wIdx++) {
         const word = words[wIdx];
         const wordWidth = ctx.measureText(word).width;
-        const spaceWidth = ctx.measureText(" ").width * 0.92;
+        const spaceWidth = ctx.measureText(" ").width * 0.9;
 
-        if (cursorX + wordWidth > rightLimit && cursorX > boxX + 10 * scaleFactor) {
+        if (
+          cursorX + wordWidth > rightLimit &&
+          cursorX > boxX + padLeftPx + 4 * scaleFactor
+        ) {
           cursorX =
             boxX +
-            4 * scaleFactor +
+            padLeftPx +
             (seededRandom(ann.seed, wordStep + 1) - 0.3) *
-              4 *
+              3 *
               scaleFactor *
               variationIntensity;
           cursorY += lineHeightPx;
@@ -318,13 +466,13 @@ export function renderAnnotationsToCanvas(
 
         const yJitter =
           (seededRandom(ann.seed, wordStep + 2) - 0.5) *
-          3.2 *
+          (isSmallCallout ? 1.4 : 2.8) *
           scaleFactor *
           variationIntensity;
         const angleRad =
           customSlantRad +
           (seededRandom(ann.seed, wordStep + 3) - 0.5) *
-            0.055 *
+            (isSmallCallout ? 0.03 : 0.05) *
             variationIntensity;
         const pressureAlpha = Math.max(
           0.68,
@@ -338,25 +486,29 @@ export function renderAnnotationsToCanvas(
         ctx.save();
         ctx.translate(cursorX, cursorY + yJitter);
         ctx.rotate(angleRad);
-        drawWordWithFontOrGlyphs(
+        drawWordWithFusedFontsOrGlyphs(
           ctx,
           word,
           fontMeta,
           fontSizePx,
           inkMeta.rgb,
-          pressureAlpha
+          pressureAlpha,
+          ann.seed + wordStep,
+          charOccurrenceCounter,
+          antiCloneEnabled,
+          variationIntensity
         );
         ctx.restore();
 
         cursorX +=
           wordWidth +
           spaceWidth *
-            (1 + (seededRandom(ann.seed, wordStep + 5) - 0.45) * 0.28 * variationIntensity);
+            (1 + (seededRandom(ann.seed, wordStep + 5) - 0.45) * 0.25 * variationIntensity);
         wordStep += 7;
       }
 
       if (pIdx < paragraphs.length - 1) {
-        cursorX = boxX + 4 * scaleFactor;
+        cursorX = boxX + padLeftPx;
         cursorY += lineHeightPx;
       }
     }
@@ -368,50 +520,93 @@ export function renderAnnotationsToCanvas(
 }
 
 /**
- * Exports the original PDF document with all handwritten answers, organic mistakes,
- * and crossed-out corrections stamped onto their exact locations.
+ * Exports the PDF document with all handwritten answers stamped onto their exact locations.
+ * Supports exporting:
+ * - Full document (original pages + any appended separate notebook sheets)
+ * - Notebook-only PDF (when onlyNotebookPages is true)
  */
 export async function exportAnnotatedPdfBytes(
   originalPdfBytes: ArrayBuffer | Uint8Array,
   pagesData: PdfPageData[],
   annotations: AnswerAnnotation[],
   style: StyleSettings,
-  allFonts: HandwritingFontOption[] = HANDWRITING_FONTS
+  allFonts: HandwritingFontOption[] = HANDWRITING_FONTS,
+  onlyNotebookPages: boolean = false
 ): Promise<Uint8Array> {
   if (document.fonts && document.fonts.ready) {
     await document.fonts.ready;
   }
 
-  const pdfDoc = await PDFDocument.load(originalPdfBytes);
-  const pdfPages = pdfDoc.getPages();
+  let pdfDoc: PDFDocument;
+  let existingPdfPages: ReturnType<PDFDocument["getPages"]> = [];
 
-  for (let i = 0; i < pdfPages.length; i++) {
-    const pageNumber = i + 1;
+  if (
+    onlyNotebookPages ||
+    !originalPdfBytes ||
+    originalPdfBytes.byteLength < 32
+  ) {
+    pdfDoc = await PDFDocument.create();
+  } else {
+    try {
+      pdfDoc = await PDFDocument.load(originalPdfBytes);
+      existingPdfPages = pdfDoc.getPages();
+    } catch {
+      pdfDoc = await PDFDocument.create();
+      existingPdfPages = [];
+    }
+  }
+
+  for (let i = 0; i < pagesData.length; i++) {
+    const pageMeta = pagesData[i];
+    const pageNumber = pageMeta.pageNumber;
     const pageAnns = annotations.filter((a) => a.pageNumber === pageNumber);
+
+    if (onlyNotebookPages && !pageMeta.isNotebookPage) {
+      continue;
+    }
+
+    let targetPdfPage = !pageMeta.isNotebookPage ? existingPdfPages[i] : undefined;
+
+    // If this is a generated Separate Notebook Page (or if we are creating a fresh page), add it to pdfDoc
+    if (!targetPdfPage) {
+      targetPdfPage = pdfDoc.addPage([pageMeta.widthPt, pageMeta.heightPt]);
+      if (pageMeta.imageDataUrl) {
+        const bgBytes = dataUrlToUint8Array(pageMeta.imageDataUrl);
+        if (bgBytes.length > 16) {
+          const bgImg = await embedImageBytesSafe(pdfDoc, bgBytes);
+          targetPdfPage.drawImage(bgImg, {
+            x: 0,
+            y: 0,
+            width: pageMeta.widthPt,
+            height: pageMeta.heightPt,
+          });
+        }
+      }
+    }
+
     if (pageAnns.length === 0) continue;
 
-    const pdfPage = pdfPages[i];
-    const { width, height } = pdfPage.getSize();
-    const pageMeta = pagesData.find((p) => p.pageNumber === pageNumber);
-
+    const { width, height } = targetPdfPage.getSize();
     const overlayCanvas = renderAnnotationsToCanvas(
-      pageMeta?.widthPt || width,
-      pageMeta?.heightPt || height,
+      pageMeta.widthPt || width,
+      pageMeta.heightPt || height,
       pageAnns,
       style,
-      2.5,
+      2.4,
       allFonts
     );
 
     const pngDataUrl = overlayCanvas.toDataURL("image/png");
-    const pngImage = await pdfDoc.embedPng(pngDataUrl);
-
-    pdfPage.drawImage(pngImage, {
-      x: 0,
-      y: 0,
-      width,
-      height,
-    });
+    const pngBytes = dataUrlToUint8Array(pngDataUrl);
+    if (pngBytes.length > 16) {
+      const pngImage = await embedImageBytesSafe(pdfDoc, pngBytes);
+      targetPdfPage.drawImage(pngImage, {
+        x: 0,
+        y: 0,
+        width,
+        height,
+      });
+    }
   }
 
   return await pdfDoc.save();

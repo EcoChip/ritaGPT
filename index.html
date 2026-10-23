@@ -16,40 +16,180 @@
   <body class="bg-slate-50 text-slate-900 antialiased selection:bg-blue-600 selection:text-white">
     <div id="root"></div>
     <script>
-      if (!Map.prototype.getOrInsert) {
-        Map.prototype.getOrInsert = function (key, defaultValue) {
-          if (!this.has(key)) {
-            this.set(key, defaultValue);
-          }
-          return this.get(key);
-        };
-      }
-      if (!Map.prototype.getOrInsertComputed) {
-        Map.prototype.getOrInsertComputed = function (key, callbackFn) {
-          if (!this.has(key)) {
-            this.set(key, callbackFn(key));
-          }
-          return this.get(key);
-        };
-      }
-      if (typeof WeakMap !== "undefined") {
-        if (!WeakMap.prototype.getOrInsert) {
-          WeakMap.prototype.getOrInsert = function (key, defaultValue) {
+      (function () {
+        if (!Map.prototype.getOrInsert) {
+          Map.prototype.getOrInsert = function (key, defaultValue) {
             if (!this.has(key)) {
               this.set(key, defaultValue);
             }
             return this.get(key);
           };
         }
-        if (!WeakMap.prototype.getOrInsertComputed) {
-          WeakMap.prototype.getOrInsertComputed = function (key, callbackFn) {
+        if (!Map.prototype.getOrInsertComputed) {
+          Map.prototype.getOrInsertComputed = function (key, callbackFn) {
             if (!this.has(key)) {
               this.set(key, callbackFn(key));
             }
             return this.get(key);
           };
         }
-      }
+        if (typeof WeakMap !== "undefined") {
+          if (!WeakMap.prototype.getOrInsert) {
+            WeakMap.prototype.getOrInsert = function (key, defaultValue) {
+              if (!this.has(key)) {
+                this.set(key, defaultValue);
+              }
+              return this.get(key);
+            };
+          }
+          if (!WeakMap.prototype.getOrInsertComputed) {
+            WeakMap.prototype.getOrInsertComputed = function (key, callbackFn) {
+              if (!this.has(key)) {
+                this.set(key, callbackFn(key));
+              }
+              return this.get(key);
+            };
+          }
+        }
+
+        // Polyfill URL.parse for Safari < 18 (used by pdfjs-dist)
+        if (typeof URL !== "undefined" && typeof URL.parse !== "function") {
+          URL.parse = function (url, base) {
+            try {
+              return base !== undefined ? new URL(url, base) : new URL(url);
+            } catch (_e) {
+              return null;
+            }
+          };
+        }
+
+        // Pure-JS safe window.atob wrapper so Safari never throws SyntaxError: The string did not match the expected pattern
+        var b64Chars =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        var b64Lookup = new Uint8Array(256);
+        for (var i = 0; i < b64Chars.length; i++) {
+          b64Lookup[b64Chars.charCodeAt(i)] = i;
+        }
+        window.atob = function (input) {
+          var str = String(input == null ? "" : input);
+          var commaIdx = str.indexOf(",");
+          if (commaIdx >= 0 && str.slice(0, commaIdx).indexOf("data:") === 0) {
+            str = str.slice(commaIdx + 1);
+          }
+          var clean = str
+            .replace(/-/g, "+")
+            .replace(/_/g, "/")
+            .replace(/[^A-Za-z0-9+/=]/g, "");
+          if (!clean) return "";
+          var pad = 0;
+          if (clean.endsWith("==")) pad = 2;
+          else if (clean.endsWith("=")) pad = 1;
+          var byteLen = Math.max(0, Math.floor((clean.length * 3) / 4) - pad);
+          var out = [];
+          var p = 0;
+          for (var j = 0; j < clean.length; j += 4) {
+            var e1 = b64Lookup[clean.charCodeAt(j)] || 0;
+            var e2 = b64Lookup[clean.charCodeAt(j + 1)] || 0;
+            var e3 = b64Lookup[clean.charCodeAt(j + 2)] || 0;
+            var e4 = b64Lookup[clean.charCodeAt(j + 3)] || 0;
+            if (p < byteLen) {
+              out.push(String.fromCharCode((e1 << 2) | (e2 >> 4)));
+              p++;
+            }
+            if (p < byteLen) {
+              out.push(String.fromCharCode(((e2 & 15) << 4) | (e3 >> 2)));
+              p++;
+            }
+            if (p < byteLen) {
+              out.push(String.fromCharCode(((e3 & 3) << 6) | (e4 & 63)));
+              p++;
+            }
+          }
+          return out.join("");
+        };
+
+        // Guard CSSStyleSheet.prototype.insertRule against malformed @font-face rules from pdfjs-dist
+        if (
+          typeof CSSStyleSheet !== "undefined" &&
+          CSSStyleSheet.prototype &&
+          typeof CSSStyleSheet.prototype.insertRule === "function"
+        ) {
+          var origInsertRule = CSSStyleSheet.prototype.insertRule;
+          CSSStyleSheet.prototype.insertRule = function (rule, index) {
+            try {
+              return origInsertRule.call(
+                this,
+                rule,
+                index !== undefined ? index : 0
+              );
+            } catch (_e) {
+              return 0;
+            }
+          };
+        }
+
+        // Guard window.FontFace so pdfjs-dist's loadSystemFont / createNativeFontFace never throws SyntaxError in Safari
+        if (typeof window.FontFace === "function") {
+          var NativeFontFace = window.FontFace;
+          var SafeFontFace = function (family, source, descriptors) {
+            var rawFam = String(family || "RitaFont")
+              .replace(/['"]/g, "")
+              .replace(/[^A-Za-z0-9_-]/g, "");
+            if (!rawFam || /^[0-9-]/.test(rawFam)) {
+              rawFam = "RitaFont" + rawFam;
+            }
+            var safeDesc = {};
+            if (descriptors && typeof descriptors === "object") {
+              if (descriptors.weight) {
+                safeDesc.weight = String(descriptors.weight);
+              }
+              if (descriptors.style) {
+                var st = String(descriptors.style).toLowerCase();
+                safeDesc.style =
+                  st.indexOf("italic") >= 0
+                    ? "italic"
+                    : st.indexOf("oblique") >= 0
+                    ? "oblique"
+                    : "normal";
+              }
+            }
+            var safeSrc = source;
+            if (typeof source === "string") {
+              var trimmed = source.trim();
+              if (!trimmed) {
+                safeSrc = 'local("Helvetica")';
+              } else {
+                safeSrc = trimmed.replace(
+                  /local\(\s*([^"'\)]+?)\s*\)/g,
+                  'local("$1")'
+                );
+              }
+            }
+            var instance;
+            try {
+              instance = new NativeFontFace(rawFam, safeSrc, safeDesc);
+            } catch (_err) {
+              instance = new NativeFontFace(
+                rawFam,
+                'local("Helvetica")',
+                safeDesc
+              );
+            }
+            var origLoad = instance.load.bind(instance);
+            instance.load = function () {
+              return origLoad().catch(function () {
+                return instance;
+              });
+            };
+            return instance;
+          };
+          SafeFontFace.prototype = NativeFontFace.prototype;
+          try {
+            Object.setPrototypeOf(SafeFontFace, NativeFontFace);
+          } catch (_e) {}
+          window.FontFace = SafeFontFace;
+        }
+      })();
     </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>

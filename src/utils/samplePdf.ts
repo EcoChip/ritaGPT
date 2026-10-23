@@ -1,4 +1,5 @@
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { PdfPageData } from "../types";
 
 /**
  * Generates a realistic 1-page multi-subject exercise worksheet PDF (Math, Physics, English & General Science)
@@ -27,13 +28,16 @@ export async function generateSampleExercisePdf(): Promise<Uint8Array> {
     color: darkSlate,
   });
 
-  page.drawText("Matemáticas, Física, Inglés y Ciencias Naturales · Nivel Secundaria / Bachillerato", {
-    x: 45,
-    y: height - 67,
-    size: 9.5,
-    font: fontItalic,
-    color: mutedGray,
-  });
+  page.drawText(
+    "Matemáticas, Física, Inglés y Ciencias Naturales · Nivel Secundaria / Bachillerato",
+    {
+      x: 45,
+      y: height - 67,
+      size: 9.5,
+      font: fontItalic,
+      color: mutedGray,
+    }
+  );
 
   page.drawLine({
     start: { x: 45, y: height - 78 },
@@ -54,13 +58,16 @@ export async function generateSampleExercisePdf(): Promise<Uint8Array> {
 
   // Exercise 1a
   y -= 24;
-  page.drawText("1. Resuelve paso a paso la siguiente ecuación de primer grado:  3(2x - 4) + 6 = 18", {
-    x: 45,
-    y,
-    size: 10,
-    font: fontRegular,
-    color: darkSlate,
-  });
+  page.drawText(
+    "1. Resuelve paso a paso la siguiente ecuación de primer grado:  3(2x - 4) + 6 = 18",
+    {
+      x: 45,
+      y,
+      size: 10,
+      font: fontRegular,
+      color: darkSlate,
+    }
+  );
 
   // Answer box 1
   y -= 52;
@@ -83,13 +90,16 @@ export async function generateSampleExercisePdf(): Promise<Uint8Array> {
 
   // Exercise 2
   y -= 26;
-  page.drawText("2. Calcula el área y la hipotenusa de un triángulo rectángulo cuyos catetos miden a = 6 cm y b = 8 cm.", {
-    x: 45,
-    y,
-    size: 10,
-    font: fontRegular,
-    color: darkSlate,
-  });
+  page.drawText(
+    "2. Calcula el área y la hipotenusa de un triángulo rectángulo cuyos catetos miden a = 6 cm y b = 8 cm.",
+    {
+      x: 45,
+      y,
+      size: 10,
+      font: fontRegular,
+      color: darkSlate,
+    }
+  );
 
   y -= 52;
   page.drawRectangle({
@@ -120,13 +130,16 @@ export async function generateSampleExercisePdf(): Promise<Uint8Array> {
   });
 
   y -= 24;
-  page.drawText("3. Un vehículo circula a velocidad constante de 90 km/h (25 m/s). ¿Qué distancia recorre en 12 segundos?", {
-    x: 45,
-    y,
-    size: 10,
-    font: fontRegular,
-    color: darkSlate,
-  });
+  page.drawText(
+    "3. Un vehículo circula a velocidad constante de 90 km/h (25 m/s). ¿Qué distancia recorre en 12 segundos?",
+    {
+      x: 45,
+      y,
+      size: 10,
+      font: fontRegular,
+      color: darkSlate,
+    }
+  );
 
   y -= 50;
   page.drawRectangle({
@@ -204,13 +217,16 @@ export async function generateSampleExercisePdf(): Promise<Uint8Array> {
   });
 
   y -= 24;
-  page.drawText("6. Explica brevemente qué es la fotosíntesis, en qué orgánulo celular ocurre y qué gas libera.", {
-    x: 45,
-    y,
-    size: 10,
-    font: fontRegular,
-    color: darkSlate,
-  });
+  page.drawText(
+    "6. Explica brevemente qué es la fotosíntesis, en qué orgánulo celular ocurre y qué gas libera.",
+    {
+      x: 45,
+      y,
+      size: 10,
+      font: fontRegular,
+      color: darkSlate,
+    }
+  );
 
   y -= 68;
   page.drawRectangle({
@@ -224,13 +240,16 @@ export async function generateSampleExercisePdf(): Promise<Uint8Array> {
   });
 
   y -= 32;
-  page.drawText("7. Calcula la derivada de la función f(x) = 4x³ - 5x² + 2x - 7 y evalúa su valor en x = 2:", {
-    x: 45,
-    y,
-    size: 10,
-    font: fontRegular,
-    color: darkSlate,
-  });
+  page.drawText(
+    "7. Calcula la derivada de la función f(x) = 4x³ - 5x² + 2x - 7 y evalúa su valor en x = 2:",
+    {
+      x: 45,
+      y,
+      size: 10,
+      font: fontRegular,
+      color: darkSlate,
+    }
+  );
 
   y -= 56;
   page.drawRectangle({
@@ -244,4 +263,174 @@ export async function generateSampleExercisePdf(): Promise<Uint8Array> {
   });
 
   return await pdfDoc.save();
+}
+
+/**
+ * Renders the sample worksheet directly onto an HTML5 Canvas as well as generating the PDF bytes,
+ * so initial startup never depends on Web Workers or PDF.js initialization.
+ */
+export async function generateSampleWorksheetDirect(): Promise<{
+  pdfBytes: Uint8Array;
+  pages: PdfPageData[];
+}> {
+  const pdfBytes = await generateSampleExercisePdf();
+  const widthPt = 595.28;
+  const heightPt = 841.89;
+  const s = 1.8;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(widthPt * s);
+  canvas.height = Math.round(heightPt * s);
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    return {
+      pdfBytes,
+      pages: [
+        {
+          pageNumber: 1,
+          imageDataUrl: "",
+          widthPt,
+          heightPt,
+          status: "idle",
+        },
+      ],
+    };
+  }
+
+  ctx.fillStyle = "#FFFFFF";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const drawBox = (x: number, topY: number, w: number, h: number, label?: string) => {
+    ctx.fillStyle = "#FBFCFE";
+    ctx.strokeStyle = "#BFC9D6";
+    ctx.lineWidth = 1 * s;
+    ctx.fillRect(x * s, topY * s, w * s, h * s);
+    ctx.strokeRect(x * s, topY * s, w * s, h * s);
+    if (label) {
+      ctx.fillStyle = "#6B788A";
+      ctx.font = `italic ${7.5 * s}px Helvetica, Arial, sans-serif`;
+      ctx.fillText(label, (x + 7) * s, (topY + 13) * s);
+    }
+  };
+
+  // Header
+  ctx.fillStyle = "#1A2433";
+  ctx.font = `bold ${13 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "FICHA DE EJERCICIOS MULTIDISCIPLINAR — EVALUACION PRACTICA",
+    45 * s,
+    50 * s
+  );
+
+  ctx.fillStyle = "#6B788A";
+  ctx.font = `italic ${9.5 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "Matemáticas, Física, Inglés y Ciencias Naturales · Nivel Secundaria / Bachillerato",
+    45 * s,
+    67 * s
+  );
+
+  ctx.strokeStyle = "#1A2433";
+  ctx.lineWidth = 1.2 * s;
+  ctx.beginPath();
+  ctx.moveTo(45 * s, 78 * s);
+  ctx.lineTo((widthPt - 45) * s, 78 * s);
+  ctx.stroke();
+
+  // Section 1
+  ctx.fillStyle = "#1A2433";
+  ctx.font = `bold ${10.5 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText("BLOQUE 1. ALGEBRA Y CALCULO MATEMATICO", 45 * s, 108 * s);
+
+  ctx.font = `${10 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "1. Resuelve paso a paso la siguiente ecuación de primer grado:  3(2x - 4) + 6 = 18",
+    45 * s,
+    132 * s
+  );
+  drawBox(45, 142, widthPt - 90, 42, "Desarrollo y solución:");
+
+  ctx.fillStyle = "#1A2433";
+  ctx.font = `${10 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "2. Calcula el área y la hipotenusa de un triángulo rectángulo cuyos catetos miden a = 6 cm y b = 8 cm.",
+    45 * s,
+    210 * s
+  );
+  drawBox(45, 220, widthPt - 90, 42, "Fórmulas y resultado:");
+
+  // Section 2
+  ctx.fillStyle = "#1A2433";
+  ctx.font = `bold ${10.5 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText("BLOQUE 2. FISICA Y QUIMICA", 45 * s, 296 * s);
+
+  ctx.font = `${10 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "3. Un vehículo circula a velocidad constante de 90 km/h (25 m/s). ¿Qué distancia recorre en 12 segundos?",
+    45 * s,
+    320 * s
+  );
+  drawBox(45, 330, widthPt - 90, 40, "Respuesta:");
+
+  // Section 3
+  ctx.fillStyle = "#1A2433";
+  ctx.font = `bold ${10.5 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "BLOQUE 3. ENGLISH GRAMMAR — COMPLETE THE SENTENCES",
+    45 * s,
+    404 * s
+  );
+
+  ctx.font = `${10 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "4. If she had studied harder for the exam, she (pass) :",
+    45 * s,
+    430 * s
+  );
+  drawBox(315, 412, 235, 24);
+
+  ctx.fillStyle = "#1A2433";
+  ctx.font = `${10 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "5. Neither the teacher nor the students (be / present) :",
+    45 * s,
+    464 * s
+  );
+  drawBox(315, 446, 235, 24);
+
+  // Section 4
+  ctx.fillStyle = "#1A2433";
+  ctx.font = `bold ${10.5 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText("BLOQUE 4. BIOLOGIA Y CIENCIAS DE LA TIERRA", 45 * s, 502 * s);
+
+  ctx.font = `${10 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "6. Explica brevemente qué es la fotosíntesis, en qué orgánulo celular ocurre y qué gas libera.",
+    45 * s,
+    526 * s
+  );
+  drawBox(45, 538, widthPt - 90, 56);
+
+  ctx.fillStyle = "#1A2433";
+  ctx.font = `${10 * s}px Helvetica, Arial, sans-serif`;
+  ctx.fillText(
+    "7. Calcula la derivada de la función f(x) = 4x³ - 5x² + 2x - 7 y evalúa su valor en x = 2:",
+    45 * s,
+    626 * s
+  );
+  drawBox(45, 638, widthPt - 90, 44);
+
+  return {
+    pdfBytes,
+    pages: [
+      {
+        pageNumber: 1,
+        imageDataUrl: canvas.toDataURL("image/jpeg", 0.88),
+        widthPt,
+        heightPt,
+        status: "idle",
+      },
+    ],
+  };
 }
