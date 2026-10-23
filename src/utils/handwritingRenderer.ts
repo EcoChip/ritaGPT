@@ -135,42 +135,42 @@ export function computeAutoFontSize(
   const isSmallCallout =
     !ann.isNotebookEntry &&
     (ann.subjectType === "short_blank" ||
-      boxWidthPx < 145 ||
-      boxHeightPx < 34);
+      boxWidthPx < 150 ||
+      boxHeightPx < 36);
 
-  const horizontalPad = isSmallCallout ? 7 : 12;
-  const verticalPad = isSmallCallout ? 3 : 6;
+  const horizontalPad = isSmallCallout ? 8 : 14;
+  const verticalPad = isSmallCallout ? 4 : 7;
 
   const usableWidth = Math.max(24, boxWidthPx - horizontalPad);
   const usableHeight = Math.max(12, boxHeightPx - verticalPad);
 
-  const minSize = ann.isNotebookEntry ? 12.5 : isSmallCallout ? 8.0 : 9.5;
+  const minSize = ann.isNotebookEntry ? 12.5 : isSmallCallout ? 8.5 : 9.5;
   const maxSize = Math.min(
-    ann.isNotebookEntry ? 21 : isSmallCallout ? 20 : 28,
-    Math.floor(usableHeight * (isSmallCallout ? 0.82 : 0.76))
+    ann.isNotebookEntry ? 20 : isSmallCallout ? 17.5 : 18.5,
+    Math.floor(usableHeight * (isSmallCallout ? 0.76 : 0.72))
   );
 
-  // Account for slight character spacing & scaleX variation (~6% buffer)
-  const effectiveMaxWidth = usableWidth * 0.93;
+  // Account for character spacing, anti-clone jitter & DOM rendering width (~9% buffer)
+  const effectiveMaxWidth = usableWidth * 0.90;
 
   for (let size = Math.max(minSize, maxSize); size >= minSize; size -= 0.5) {
     ctx.font = `${fontMeta.baseWeight} ${size}px ${fontMeta.cssFamily}`;
     const lines = wrapTextLines(ctx, fullSampleText, effectiveMaxWidth);
     const lineHeight =
-      size * (isSmallCallout ? Math.min(1.12, fontMeta.lineHeightMultiplier) : fontMeta.lineHeightMultiplier);
+      size * (isSmallCallout ? Math.min(1.1, fontMeta.lineHeightMultiplier) : fontMeta.lineHeightMultiplier);
     const totalHeight = lines.length * lineHeight;
     const widestLine = Math.max(
       ...lines.map((l) => ctx.measureText(l).width),
       0
     );
 
-    // For very short callout boxes (height < 26pt), strongly prefer fitting on 1 single line if possible
+    // For short callout boxes, strongly prefer fitting on 1 single line
     const fitsSingleLineWhenTiny =
-      !isSmallCallout || boxHeightPx >= 27 || lines.length === 1 || size <= 9.5;
+      !isSmallCallout || boxHeightPx >= 30 || lines.length === 1 || size <= 9.0;
 
     if (
       totalHeight <= usableHeight &&
-      widestLine <= usableWidth &&
+      widestLine <= usableWidth * 0.94 &&
       fitsSingleLineWhenTiny
     ) {
       return Number(size.toFixed(1));

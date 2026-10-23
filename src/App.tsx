@@ -4,6 +4,7 @@ import {
   HANDWRITING_FONTS,
   HandwritingFontOption,
   INK_COLORS,
+  NormalizedBox,
   NotebookPaperStyle,
   PdfPageData,
   SolveTargetMode,
@@ -30,7 +31,11 @@ import {
   loadSavedCustomFonts,
   saveCustomFontsToStorage,
 } from "./utils/customFontManager";
-import { refinePageAnnotationsWithPixels } from "./utils/blankRefiner";
+import {
+  detectBlankBoxAtPoint,
+  refinePageAnnotationsWithPixels,
+  refineSingleAnnotationWithPixels,
+} from "./utils/blankRefiner";
 import {
   getBuildTimeGeminiKey,
   solvePageViaDirectRestApi,
@@ -60,6 +65,12 @@ import {
   Camera,
   PenTool,
   ArrowRight,
+  ArrowLeft,
+  ArrowUp,
+  ArrowDown,
+  Crosshair,
+  Sparkles,
+  Copy,
   Image as ImageIcon,
   FolderOpen,
   BookOpen,
@@ -94,6 +105,7 @@ export default function App() {
   const [zoom, setZoom] = useState<number>(1.05);
   const [showBoundingGuides, setShowBoundingGuides] = useState<boolean>(true);
   const [isAddingMode, setIsAddingMode] = useState<boolean>(false);
+  const [isRedrawingBoxMode, setIsRedrawingBoxMode] = useState<boolean>(false);
   const [activeSidebarTab, setActiveSidebarTab] = useState<"style" | "exercises">("style");
   const [customInstructions, setCustomInstructions] = useState<string>("");
 
@@ -348,18 +360,25 @@ export default function App() {
       .sort((a, b) => a.score - b.score)
       .map((x) => x.idx);
 
-    // Only place crossed-out words ("tachones") in boxes wide enough to fit both the crossed-out word and the answer
-    // Never place a crossed-out word inside a tiny diagram label box (short_blank or narrow box < 24% width)
+    // Only place crossed-out words ("tachones") in wide open-text boxes where a multi-word sentence is written.
+    // Never place a crossed-out word inside a diagram label box (short_blank, narrow box < 32% width, or 1-2 word label).
     const eligibleForCrossOut = items
-      .map((item, idx) => ({
-        idx,
-        eligible:
-          Boolean(item.isNotebookEntry) ||
-          (item.subjectType !== "short_blank" &&
-            item.box.width >= 24 &&
-            item.box.height >= 4.2),
-        score: seededRandom(item.seed + extraSeedOffset, 29),
-      }))
+      .map((item, idx) => {
+        const wordCount = item.correctAnswer
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean).length;
+        return {
+          idx,
+          eligible:
+            Boolean(item.isNotebookEntry) ||
+            (item.subjectType !== "short_blank" &&
+              item.box.width >= 32 &&
+              item.box.height >= 4.2 &&
+              wordCount >= 3),
+          score: seededRandom(item.seed + extraSeedOffset, 29),
+        };
+      })
       .filter((x) => x.eligible)
       .sort((a, b) => a.score - b.score)
       .map((x) => x.idx);
@@ -740,39 +759,121 @@ export default function App() {
     setAnnotations((prev) => prev.filter((ann) => ann.id !== id));
     if (selectedAnnotationId === id) {
       setSelectedAnnotationId(null);
+      setIsRedrawingBoxMode(false);
     }
   };
 
-  const handleAddAnnotationAtPoint = (
+  const handleDuplicateAnnotation = (id: string) => {
+    const source = annotations.find((a) => a.id === id);
+    if (!source) return;
+    const newId = `dup-${Date.now()}`;
+    const copy: AnswerAnnotation = {
+      ...source,
+      id: newId,
+      questionLabel: `${source.questionLabel} (copia)`,
+      box: {
+        ...source.box,
+        x: Number(Math.min(92, source.box.x + 1.8).toFixed(2)),
+        y: Number(Math.min(94, source.box.y + 2.2).toFixed(2)),
+      },
+      seed: source.seed + 37,
+    };
+    setAnnotations((prev) => [...prev, copy]);
+    setSelectedAnnotationId(newId);
+  };
+
+  const handleSnapSingleAnnotation = async (id: string) => {
+    const target = annotations.find((a) => a.id === id);
+    if (!target) return;
+    const pageObj = pages.find((p) => p.pageNumber === target.pageNumber);
+    if (!pageObj || pageObj.isNotebookPage) return;
+
+    const samePageAnns = annotations.filter(
+      (a) => a.pageNumber === target.pageNumber
+    );
+    const snappedBox = await refineSingleAnnotationWithPixels(
+      pageObj.imageDataUrl,
+      target,
+      samePageAnns
+    );
+    handleUpdateAnnotation(id, { box: snappedBox });
+  };
+
+  const handleRedrawSelectedBox = (id: string, drawnBox: NormalizedBox) => {
+    handleUpdateAnnotation(id, { box: drawnBox });
+    setIsRedrawingBoxMode(false);
+  };
+
+  const handleNudgeAnnotation = (
+    id: string,
+    dxPercent: number,
+    dyPercent: number,
+    dwPercent: number = 0,
+    dhPercent: number = 0
+  ) => {
+    setAnnotations((prev) =>
+      prev.map((ann) => {
+        if (ann.id !== id) return ann;
+        const nextW = Math.max(4.5, Math.min(96, ann.box.width + dwPercent));
+        const nextH = Math.max(1.8, Math.min(45, ann.box.height + dhPercent));
+        const nextX = Math.max(0, Math.min(100 - nextW, ann.box.x + dxPercent));
+        const nextY = Math.max(0, Math.min(100 - nextH, ann.box.y + dyPercent));
+        return {
+          ...ann,
+          box: {
+            x: Number(nextX.toFixed(2)),
+            y: Number(nextY.toFixed(2)),
+            width: Number(nextW.toFixed(2)),
+            height: Number(nextH.toFixed(2)),
+          },
+        };
+      })
+    );
+  };
+
+  const handleAddAnnotationAtPoint = async (
     pageNumber: number,
     xPercent: number,
-    yPercent: number
+    yPercent: number,
+    drawnBox?: NormalizedBox
   ) => {
     const newId = `manual-${Date.now()}`;
     const pageCount = annotations.filter((a) => a.pageNumber === pageNumber).length;
+    const pageObj = pages.find((p) => p.pageNumber === pageNumber);
+
+    let initialBox: NormalizedBox = drawnBox || {
+      x: Number(Math.max(1, Math.min(80, xPercent - 9)).toFixed(2)),
+      y: Number(Math.max(1, Math.min(92, yPercent - 1.8)).toFixed(2)),
+      width: 24,
+      height: 4.2,
+    };
+
+    if (!drawnBox && pageObj && !pageObj.isNotebookPage) {
+      initialBox = await detectBlankBoxAtPoint(
+        pageObj.imageDataUrl,
+        xPercent,
+        yPercent
+      );
+    }
+
+    const isSmall = initialBox.width <= 28 && initialBox.height <= 6.2;
+
     const newAnn: AnswerAnnotation = {
       id: newId,
       pageNumber,
-      questionLabel: `Nota ${pageCount + 1}`,
-      questionSummary: "Respuesta añadida manualmente",
-      subjectType: "open_text",
-      correctAnswer: "Respuesta escrita a mano",
-      organicMistakeAnswer: "Respuesta con leve fallo",
+      questionLabel: `${pageCount + 1}`,
+      questionSummary: "Hueco añadido manualmente",
+      subjectType: isSmall ? "short_blank" : "open_text",
+      correctAnswer: "Respuesta",
+      organicMistakeAnswer: "Respuesta leve fallo",
       mistakeExplanation: "Variante manual editable",
       crossedOutWord: "error",
       customText: null,
-      box: {
-        x: Number(xPercent.toFixed(2)),
-        y: Number(yPercent.toFixed(2)),
-        width: 38,
-        height: 6,
-      },
+      box: initialBox,
       useMistake: false,
-      useCrossOut:
-        styleSettings.organic.enabled &&
-        styleSettings.organic.crossOutRatePercent >= 30,
+      useCrossOut: false,
       autoFitFont: true,
-      manualFontSize: 16,
+      manualFontSize: 15,
       seed: Math.floor(Math.random() * 1000) + 1,
     };
 
@@ -1324,25 +1425,30 @@ export default function App() {
                   <button
                     type="button"
                     onClick={handleAutoRefineCurrentPageBoxes}
-                    title="Encaja automáticamente las cajas en los huecos blancos sin pisar las preguntas impresas"
-                    className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+                    title="Encaja automáticamente todas las cajas de esta página en los recuadros blancos sin pisar las preguntas impresas"
+                    className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    <Sliders className="w-3.5 h-3.5 text-blue-700" />
-                    <span>Ajustar Huecos</span>
+                    <Sparkles className="w-3.5 h-3.5 text-blue-700" />
+                    <span>Auto-Encajar Huecos</span>
                   </button>
                 )}
 
                 <button
                   type="button"
-                  onClick={() => setIsAddingMode((v) => !v)}
+                  onClick={() => {
+                    setIsRedrawingBoxMode(false);
+                    setIsAddingMode((v) => !v);
+                  }}
                   className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
                     isAddingMode
-                      ? "bg-blue-50 border-blue-600 text-blue-700"
+                      ? "bg-blue-600 border-blue-600 text-white shadow-xs"
                       : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
                   }`}
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>{isAddingMode ? "Clic en hoja..." : "Añadir Caja"}</span>
+                  <span>
+                    {isAddingMode ? "Arrastra en la hoja..." : "Dibujar Hueco"}
+                  </span>
                 </button>
 
                 <button
@@ -1470,18 +1576,193 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* Docked iPad Touch Quick-Control Bar when an Answer Box is Selected */}
+                  {(() => {
+                    const selectedAnn = currentPageAnnotations.find(
+                      (a) => a.id === selectedAnnotationId
+                    );
+                    if (!selectedAnn) return null;
+                    const currentFontPt = computeAutoFontSize(
+                      selectedAnn,
+                      (selectedAnn.box.width / 100) * activePageData.widthPt,
+                      (selectedAnn.box.height / 100) * activePageData.heightPt,
+                      styleSettings,
+                      allFonts
+                    );
+                    return (
+                      <div className="mb-4 max-w-4xl w-full bg-slate-900 text-white rounded-xl px-3.5 py-2.5 shadow-md border border-slate-700 flex flex-wrap items-center justify-between gap-3 z-20">
+                        {/* Left: Instant Inline Text Input for Selected Box */}
+                        <div className="flex items-center gap-2 flex-1 min-w-[210px]">
+                          <span className="px-2 py-1 rounded bg-blue-600 text-[11px] font-mono-tabular font-bold shrink-0">
+                            {selectedAnn.questionLabel}
+                          </span>
+                          <input
+                            type="text"
+                            value={getAnnotationActiveText(selectedAnn)}
+                            onChange={(e) =>
+                              handleUpdateAnnotation(selectedAnn.id, {
+                                customText: e.target.value,
+                              })
+                            }
+                            placeholder="Escribe la respuesta..."
+                            className="flex-1 bg-slate-800 border border-slate-700 focus:border-blue-400 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none"
+                          />
+                        </div>
+
+                        {/* Middle: Touch Nudge D-Pad (Move by 0.5% per tap) */}
+                        <div className="flex items-center gap-1 bg-slate-800/90 p-1 rounded-lg border border-slate-700">
+                          <span className="text-[10px] text-slate-400 px-1 hidden sm:inline">
+                            Mover:
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleNudgeAnnotation(selectedAnn.id, -0.6, 0)
+                            }
+                            title="Mover a la izquierda"
+                            className="p-1.5 rounded hover:bg-slate-700 active:scale-90 transition-transform"
+                          >
+                            <ArrowLeft className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleNudgeAnnotation(selectedAnn.id, 0, -0.5)
+                            }
+                            title="Mover arriba"
+                            className="p-1.5 rounded hover:bg-slate-700 active:scale-90 transition-transform"
+                          >
+                            <ArrowUp className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleNudgeAnnotation(selectedAnn.id, 0, 0.5)
+                            }
+                            title="Mover abajo"
+                            className="p-1.5 rounded hover:bg-slate-700 active:scale-90 transition-transform"
+                          >
+                            <ArrowDown className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleNudgeAnnotation(selectedAnn.id, 0.6, 0)
+                            }
+                            title="Mover a la derecha"
+                            className="p-1.5 rounded hover:bg-slate-700 active:scale-90 transition-transform"
+                          >
+                            <ArrowRight className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {/* Right: Redraw with Finger, Smart Snap & Font Size */}
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsAddingMode(false);
+                              setIsRedrawingBoxMode((v) => !v);
+                            }}
+                            title="Arrastra el dedo sobre la hoja para redibujar el hueco exacto de esta respuesta"
+                            className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                              isRedrawingBoxMode
+                                ? "bg-amber-500 text-slate-950"
+                                : "bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                            }`}
+                          >
+                            <Crosshair className="w-3.5 h-3.5" />
+                            <span>
+                              {isRedrawingBoxMode
+                                ? "Arrastra en hoja..."
+                                : "Redibujar Hueco"}
+                            </span>
+                          </button>
+
+                          {!selectedAnn.isNotebookEntry && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleSnapSingleAnnotation(selectedAnn.id)
+                              }
+                              title="Encajar automáticamente dentro del recuadro o debajo del texto impreso"
+                              className="px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                            >
+                              <Sparkles className="w-3.5 h-3.5" />
+                              <span>Encajar</span>
+                            </button>
+                          )}
+
+                          <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 p-0.5 text-xs">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleUpdateAnnotation(selectedAnn.id, {
+                                  autoFitFont: false,
+                                  manualFontSize: Math.max(
+                                    8,
+                                    Math.round(currentFontPt - 1)
+                                  ),
+                                })
+                              }
+                              className="px-2 py-1 hover:bg-slate-700 rounded font-semibold"
+                            >
+                              A-
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleUpdateAnnotation(selectedAnn.id, {
+                                  autoFitFont: true,
+                                })
+                              }
+                              title="Pulsar para reactivar ajuste automático de letra"
+                              className={`px-1.5 py-1 font-mono-tabular text-[11px] rounded ${
+                                selectedAnn.autoFitFont
+                                  ? "text-blue-300"
+                                  : "text-amber-300 underline"
+                              }`}
+                            >
+                              {Math.round(currentFontPt)}pt
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleUpdateAnnotation(selectedAnn.id, {
+                                  autoFitFont: false,
+                                  manualFontSize: Math.min(
+                                    34,
+                                    Math.round(currentFontPt + 1)
+                                  ),
+                                })
+                              }
+                              className="px-2 py-1 hover:bg-slate-700 rounded font-semibold"
+                            >
+                              A+
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   <InteractivePageCanvas
                     page={activePageData}
                     annotations={currentPageAnnotations}
                     selectedAnnotationId={selectedAnnotationId}
                     onSelectAnnotation={(id) => {
                       setSelectedAnnotationId(id);
+                      setIsRedrawingBoxMode(false);
                       if (id) setActiveSidebarTab("exercises");
                     }}
                     onUpdateAnnotation={handleUpdateAnnotation}
                     onDeleteAnnotation={handleDeleteAnnotation}
+                    onDuplicateAnnotation={handleDuplicateAnnotation}
+                    onSnapSingleAnnotation={handleSnapSingleAnnotation}
                     onAddAnnotationAtPoint={handleAddAnnotationAtPoint}
+                    onRedrawSelectedBox={handleRedrawSelectedBox}
                     isAddingMode={isAddingMode}
+                    isRedrawingBoxMode={isRedrawingBoxMode}
                     styleSettings={styleSettings}
                     allFonts={allFonts}
                     zoom={zoom}

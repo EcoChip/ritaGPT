@@ -69,12 +69,15 @@ Analiza cuidadosamente la imagen de la página y sigue estas reglas:
    - Pon "requiresSeparateNotebook": false si la página es una ficha de trabajo (worksheet) o examen que TIENE huecos en blanco, recuadros vacíos, etiquetas de diagramas/esquemas para rellenar, tablas o líneas punteadas para escribir directamente en la hoja.
    - Pon "requiresSeparateNotebook": true ÚNICAMENTE si la página es una hoja de libro de texto densa (como Lectura y comentario, Literatura, Historia, Filosofía) donde NO hay recuadros ni huecos físicos para responder en la hoja y las preguntas deben contestarse en una hoja de cuaderno aparte.
 
-2. REGLAS CRÍTICAS DE PRECISIÓN PARA LOS HUECOS ("blankBox2d" = [ymin, xmin, ymax, xmax] en escala 0 a 1000):
-   - REGLA DE ORO Nº 1 (RECUADROS CON PREGUNTA IMPRESA DENTRO): Muchos ejercicios (ej. apartados "a.", "b.", "c.") tienen un gran recuadro rectangular donde la PRIMERA línea dentro del recuadro contiene el enunciado impreso (ej. "a. ¿De qué tipo de célula se trata? ¿Por qué lo sabes?") y DEBAJO de ese texto impreso está el espacio en blanco para responder. En estos casos, "ymin" DEBE empezar ESTRICTAMENTE DEBAJO de la línea de texto impreso de la pregunta (nunca incluyas el texto impreso de la pregunta dentro de blankBox2d).
+2. REGLAS CRÍTICAS DE PRECISIÓN MILIMÉTRICA PARA LOS HUECOS ("blankBox2d" = [ymin, xmin, ymax, xmax] en escala 0 a 1000):
+   - REGLA DE ORO Nº 1 (RECUADROS GRANDES CON PREGUNTA IMPRESA DENTRO): Muchos ejercicios (ej. apartados "a.", "b.", "c.") tienen un gran recuadro rectangular donde la parte superior dentro del propio recuadro contiene el enunciado impreso (ej. "a. ¿De qué tipo de célula se trata? ¿Por qué lo sabes?", "b. ¿Qué función desempeña...?", "c. ¿Para qué sirven...?") y DEBAJO de ese texto impreso está la mitad inferior blanca para escribir la respuesta. En estos casos:
+     * PROHIBIDO devolver el recuadro completo desde su borde superior.
+     * "ymin" DEBE empezar ESTRICTAMENTE EN LA MITAD INFERIOR BLANCA (al menos 22 a 32 puntos por debajo del borde superior del recuadro), justo debajo de la línea de texto impreso de la pregunta.
    - REGLA DE ORO Nº 2 (ESQUEMAS, CÉLULAS, MAPAS Y DIAGRAMAS CON RECUADROS): Si hay un dibujo o esquema (ej. una célula procariota/eucariota, aparato del cuerpo, mapa, circuito) con recuadros vacíos alrededor unidos por flechas o líneas:
-     * Revisa TODOS los recuadros vacíos de la izquierda y TODOS los de la derecha (de arriba abajo) sin saltarte ninguno.
-     * Para cada recuadro vacío del esquema, usa "subjectType": "short_blank".
-     * "blankBox2d" debe ajustarse exactamente al interior blanco de ese recuadro individual, sin tocar otros recuadros cercanos.
+     * Revisa TODOS los recuadros vacíos de la izquierda, derecha y parte inferior sin saltarte ninguno.
+     * Presta especial atención a los recuadros de la parte inferior del dibujo (a menudo numerados como 6, 7, 8, 9): localiza con exactitud los 4 bordes de cada recuadro rectangular y NO desplaces las cajas hacia el espacio vacío debajo de ellos.
+     * Si el recuadro tiene un numerito impreso a la izquierda (ej. "4.", "8."), haz que "xmin" empiece justo a la derecha del numerito impreso.
+     * Para cada recuadro vacío del esquema, usa SIEMPRE "subjectType": "short_blank".
      * "correctAnswer" para un recuadro de esquema ("short_blank") debe ser ÚNICAMENTE el nombre corto del elemento (1 o 2 palabras máximo, ej. "Flagelo", "Citoplasma", "Ribosomas", "Nucleoide", "Cápsula", "Pared bacteriana", "Membrana plasmática", "Fimbrias"), NUNCA una frase larga ni el número del recuadro.
    - REGLA DE ORO Nº 3 (LÍNEAS EN BLANCO JUNTO A TEXTO): Si el hueco está a la derecha de un texto impreso (ej. "Nombre: _______"), "xmin" debe empezar justo a la derecha de donde termina el texto impreso, nunca encima de las letras impresas.
 
