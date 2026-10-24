@@ -56,6 +56,10 @@ export interface StyleSettings {
   organic: OrganicSettings;
   solveTargetMode: SolveTargetMode;
   notebookPaperStyle: NotebookPaperStyle;
+  /** Global handwriting font size in pt (default 19pt) */
+  baseFontSize: number;
+  /** When true (default), all handwriting answers are kept at the same uniform font size (19pt) */
+  uniformFontSize: boolean;
 }
 
 export interface NormalizedBox {

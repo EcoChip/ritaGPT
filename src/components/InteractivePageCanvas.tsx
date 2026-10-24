@@ -594,6 +594,21 @@ export const InteractivePageCanvas: React.FC<InteractivePageCanvasProps> = ({
                 >
                   A+
                 </button>
+                {Math.round(baseFontSizePt) !== 19 && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onUpdateAnnotation(ann.id, {
+                        autoFitFont: true,
+                        manualFontSize: 19,
+                      })
+                    }
+                    title="Restablecer tamaño a 19pt"
+                    className="px-2 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 active:scale-95 text-[11px] font-bold text-white transition-transform"
+                  >
+                    19pt
+                  </button>
+                )}
 
                 {/* 1-Tap Smart Snap to Cavity */}
                 {!ann.isNotebookEntry && onSnapSingleAnnotation && (

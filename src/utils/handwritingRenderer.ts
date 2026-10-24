@@ -117,10 +117,20 @@ export function computeAutoFontSize(
   style: StyleSettings,
   allFonts: HandwritingFontOption[] = HANDWRITING_FONTS
 ): number {
-  if (!ann.autoFitFont) {
+  const globalTarget = style?.baseFontSize || 19;
+
+  // If user disabled auto-fit for this specific box and adjusted manual size, respect it
+  if (!ann.autoFitFont && ann.manualFontSize) {
     return ann.manualFontSize;
   }
 
+  // When uniform font size is active (default: true, set to 19pt):
+  // Every single answer remains strictly at the exact same handwriting size (19pt)
+  if (!style || style.uniformFontSize !== false) {
+    return globalTarget;
+  }
+
+  // Adaptive sizing fallback when user specifically disables uniform font size
   const fontMeta = resolveFontOption(style.fontId, allFonts);
   const activeText = getAnnotationActiveText(ann);
   const fullSampleText =
@@ -130,7 +140,7 @@ export function computeAutoFontSize(
 
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
-  if (!ctx) return 15;
+  if (!ctx) return globalTarget;
 
   const isSmallCallout =
     !ann.isNotebookEntry &&
@@ -144,20 +154,26 @@ export function computeAutoFontSize(
   const usableWidth = Math.max(24, boxWidthPx - horizontalPad);
   const usableHeight = Math.max(12, boxHeightPx - verticalPad);
 
-  const minSize = ann.isNotebookEntry ? 12.5 : isSmallCallout ? 8.5 : 9.5;
-  const maxSize = Math.min(
-    ann.isNotebookEntry ? 20 : isSmallCallout ? 17.5 : 18.5,
-    Math.floor(usableHeight * (isSmallCallout ? 0.76 : 0.72))
+  const minSize = ann.isNotebookEntry ? 12.5 : isSmallCallout ? 9.5 : 11;
+  const maxSize = Math.max(
+    minSize,
+    Math.min(
+      globalTarget,
+      Math.floor(usableHeight * (isSmallCallout ? 0.82 : 0.78))
+    )
   );
 
   // Account for character spacing, anti-clone jitter & DOM rendering width (~9% buffer)
-  const effectiveMaxWidth = usableWidth * 0.90;
+  const effectiveMaxWidth = usableWidth * 0.9;
 
   for (let size = Math.max(minSize, maxSize); size >= minSize; size -= 0.5) {
     ctx.font = `${fontMeta.baseWeight} ${size}px ${fontMeta.cssFamily}`;
     const lines = wrapTextLines(ctx, fullSampleText, effectiveMaxWidth);
     const lineHeight =
-      size * (isSmallCallout ? Math.min(1.1, fontMeta.lineHeightMultiplier) : fontMeta.lineHeightMultiplier);
+      size *
+      (isSmallCallout
+        ? Math.min(1.1, fontMeta.lineHeightMultiplier)
+        : fontMeta.lineHeightMultiplier);
     const totalHeight = lines.length * lineHeight;
     const widestLine = Math.max(
       ...lines.map((l) => ctx.measureText(l).width),
@@ -166,7 +182,7 @@ export function computeAutoFontSize(
 
     // For short callout boxes, strongly prefer fitting on 1 single line
     const fitsSingleLineWhenTiny =
-      !isSmallCallout || boxHeightPx >= 30 || lines.length === 1 || size <= 9.0;
+      !isSmallCallout || boxHeightPx >= 30 || lines.length === 1 || size <= 11.0;
 
     if (
       totalHeight <= usableHeight &&
@@ -333,10 +349,10 @@ export function renderAnnotationsToCanvas(
     if (!ann.isNotebookEntry) {
       ctx.beginPath();
       ctx.rect(
-        boxX - 3 * scaleFactor,
-        boxY - 3 * scaleFactor,
-        boxW + 6 * scaleFactor,
-        boxH + 6 * scaleFactor
+        boxX - 4 * scaleFactor,
+        boxY - 4 * scaleFactor,
+        boxW + 12 * scaleFactor,
+        boxH + 12 * scaleFactor
       );
       ctx.clip();
     }

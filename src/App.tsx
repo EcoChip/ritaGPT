@@ -126,6 +126,8 @@ export default function App() {
     inkId: "bic-blue",
     solveTargetMode: "auto",
     notebookPaperStyle: "grid",
+    baseFontSize: 19,
+    uniformFontSize: true,
     organic: {
       enabled: true,
       mistakeRatePercent: 15,
@@ -659,7 +661,7 @@ export default function App() {
                 useMistake: false,
                 useCrossOut: false,
                 autoFitFont: true,
-                manualFontSize: 15,
+                manualFontSize: 19,
                 seed: pageObj.pageNumber * 100 + index * 17 + 1,
               };
             }
@@ -873,7 +875,7 @@ export default function App() {
       useMistake: false,
       useCrossOut: false,
       autoFitFont: true,
-      manualFontSize: 15,
+      manualFontSize: 19,
       seed: Math.floor(Math.random() * 1000) + 1,
     };
 
@@ -898,6 +900,36 @@ export default function App() {
     }
   };
 
+  const handleApplyUniformFontSize = (sizePt: number = 19) => {
+    setStyleSettings((prev) => ({
+      ...prev,
+      baseFontSize: sizePt,
+      uniformFontSize: true,
+    }));
+    setAnnotations((prev) =>
+      prev.map((ann) => ({
+        ...ann,
+        manualFontSize: sizePt,
+        autoFitFont: true,
+      }))
+    );
+  };
+
+  const handleToggleUniformFontSize = (enabled: boolean) => {
+    setStyleSettings((prev) => ({
+      ...prev,
+      uniformFontSize: enabled,
+    }));
+    if (enabled) {
+      setAnnotations((prev) =>
+        prev.map((ann) => ({
+          ...ann,
+          manualFontSize: styleSettings.baseFontSize || 19,
+          autoFitFont: true,
+        }))
+      );
+    }
+  };
   const handleReshuffleOrganic = () => {
     if (annotations.length === 0) return;
     const randomOffset = Math.floor(Math.random() * 500) + 7;
@@ -1716,7 +1748,7 @@ export default function App() {
                                   autoFitFont: true,
                                 })
                               }
-                              title="Pulsar para reactivar ajuste automático de letra"
+                              title="Pulsar para reactivar ajuste de letra"
                               className={`px-1.5 py-1 font-mono-tabular text-[11px] rounded ${
                                 selectedAnn.autoFitFont
                                   ? "text-blue-300"
@@ -1741,6 +1773,19 @@ export default function App() {
                               A+
                             </button>
                           </div>
+
+                          <button
+                            type="button"
+                            onClick={() => handleApplyUniformFontSize(19)}
+                            title="Fijar todas las respuestas al mismo tamaño 19pt"
+                            className={`px-2 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer shrink-0 ${
+                              styleSettings.baseFontSize === 19 && styleSettings.uniformFontSize
+                                ? "bg-blue-600 text-white shadow-2xs"
+                                : "bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700"
+                            }`}
+                          >
+                            Todo al 19
+                          </button>
                         </div>
                       </div>
                     );
@@ -1964,10 +2009,110 @@ export default function App() {
 
                   <hr className="border-slate-200" />
 
-                  {/* Section 2: Ink Color */}
+                  {/* Section 3: Uniform Handwriting Font Size */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <h2 className="font-display text-sm font-semibold text-slate-900">
+                          03. Tamaño de Caligrafía
+                        </h2>
+                        <p className="text-xs text-slate-500">
+                          Tamaño idéntico y homogéneo en todas las respuestas
+                        </p>
+                      </div>
+                      <span className="font-mono-tabular font-bold text-xs text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md border border-blue-200">
+                        {styleSettings.baseFontSize || 19} pt
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-3">
+                      {/* Quick Presets with 19 highlighted */}
+                      <div className="flex items-center justify-between gap-1">
+                        {[15, 17, 19, 21, 23].map((pt) => {
+                          const isCurrent = (styleSettings.baseFontSize || 19) === pt;
+                          return (
+                            <button
+                              key={pt}
+                              type="button"
+                              onClick={() => handleApplyUniformFontSize(pt)}
+                              className={`flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                                isCurrent
+                                  ? "bg-blue-600 text-white shadow-2xs"
+                                  : "bg-white border border-slate-200 text-slate-700 hover:bg-slate-100"
+                              }`}
+                            >
+                              {pt} pt
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Main Action: Fijar todas las respuestas al tamaño 19 */}
+                      <button
+                        type="button"
+                        onClick={() => handleApplyUniformFontSize(19)}
+                        className="w-full py-2 px-3 bg-blue-700 hover:bg-blue-800 text-white font-semibold rounded-lg text-xs flex items-center justify-center gap-2 transition-colors shadow-2xs cursor-pointer"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Fijar todas las respuestas al tamaño 19</span>
+                      </button>
+
+                      {/* Stepper + Uniform Toggle */}
+                      <div className="flex items-center justify-between pt-1 border-t border-slate-200/70 text-xs">
+                        <span className="font-medium text-slate-700">
+                          Ajustar tamaño fino:
+                        </span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleApplyUniformFontSize(
+                                Math.max(10, (styleSettings.baseFontSize || 19) - 1)
+                              )
+                            }
+                            className="w-6 h-6 flex items-center justify-center bg-white border border-slate-200 hover:bg-slate-100 rounded text-xs font-bold text-slate-700 cursor-pointer"
+                          >
+                            -
+                          </button>
+                          <span className="w-9 text-center font-mono-tabular font-bold text-slate-900">
+                            {styleSettings.baseFontSize || 19}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleApplyUniformFontSize(
+                                Math.min(32, (styleSettings.baseFontSize || 19) + 1)
+                              )
+                            }
+                            className="w-6 h-6 flex items-center justify-center bg-white border border-slate-200 hover:bg-slate-100 rounded text-xs font-bold text-slate-700 cursor-pointer"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between pt-1 border-t border-slate-200/70 text-xs">
+                        <span className="font-medium text-slate-700">
+                          Forzar mismo tamaño en todas las cajas:
+                        </span>
+                        <input
+                          type="checkbox"
+                          checked={styleSettings.uniformFontSize}
+                          onChange={(e) =>
+                            handleToggleUniformFontSize(e.target.checked)
+                          }
+                          className="w-4 h-4 accent-blue-700 cursor-pointer"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <hr className="border-slate-200" />
+
+                  {/* Section 4: Ink Color */}
                   <div>
                     <h2 className="font-display text-sm font-semibold text-slate-900 mb-2.5">
-                      03. Tinta y Bolígrafo
+                      04. Tinta y Bolígrafo
                     </h2>
                     <div className="grid grid-cols-2 gap-2">
                       {INK_COLORS.map((ink) => {
@@ -2001,12 +2146,12 @@ export default function App() {
 
                   <hr className="border-slate-200" />
 
-                  {/* Section 3: Organic Mode (Human Imperfections & Anti-Clone) */}
+                  {/* Section 5: Organic Mode (Human Imperfections & Anti-Clone) */}
                   <div>
                     <div className="flex items-center justify-between mb-2">
                       <div>
                         <h2 className="font-display text-sm font-semibold text-slate-900">
-                          04. Modo Orgánico Humano
+                          05. Modo Orgánico Humano
                         </h2>
                         <p className="text-xs text-slate-500">
                           Variación de letras repetidas, tachones y deslices

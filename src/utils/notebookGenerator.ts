@@ -192,7 +192,7 @@ export function buildNotebookPagesForExercises(
       useMistake: false,
       useCrossOut: false,
       autoFitFont: true,
-      manualFontSize: 16,
+      manualFontSize: 19,
       seed: sourcePageNumber * 200 + index * 23 + 3,
       isNotebookEntry: true,
     });
